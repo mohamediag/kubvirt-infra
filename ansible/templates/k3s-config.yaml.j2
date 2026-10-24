@@ -1,0 +1,16 @@
+# Managed by kubevirt-infra (ansible/playbooks/k3s.yml).
+cluster-init: true
+node-ip: {{ node_ip }}
+advertise-address: {{ node_ip }}
+tls-san:
+  - {{ node_ip }}
+cluster-cidr: {{ pod_cidr }}
+service-cidr: {{ service_cidr }}
+write-kubeconfig-mode: "0600"
+# Networking is handled by Cilium (CNI, network policy, kube-proxy replacement).
+flannel-backend: none
+disable-network-policy: true
+disable-kube-proxy: true
+disable:
+  - traefik
+  - servicelb

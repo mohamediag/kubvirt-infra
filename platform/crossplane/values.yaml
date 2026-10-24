@@ -1,0 +1,2 @@
+# Crossplane Helm values (chart version in ansible/group_vars/all/versions.yml).
+replicas: 1

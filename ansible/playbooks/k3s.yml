@@ -1,0 +1,77 @@
+# Installs k3s (embedded etcd, no flannel/kube-proxy) and Cilium as its CNI.
+- name: Install k3s with Cilium
+  hosts: all
+  become: true
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: k3s config directory
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        mode: "0755"
+
+    - name: k3s config
+      ansible.builtin.template:
+        src: ../templates/k3s-config.yaml.j2
+        dest: /etc/rancher/k3s/config.yaml
+        mode: "0600"
+      register: k3s_config
+
+    - name: Check installed k3s version
+      ansible.builtin.shell: k3s --version 2>/dev/null | awk 'NR==1{print $3}'
+      register: k3s_installed
+      changed_when: false
+
+    - name: Download k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/src/k3s-install.sh
+        mode: "0755"
+
+    - name: Install k3s
+      ansible.builtin.command: /usr/local/src/k3s-install.sh
+      environment:
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+      when: k3s_installed.stdout != k3s_version
+      register: k3s_install
+
+    - name: Restart k3s after config change
+      ansible.builtin.systemd_service:
+        name: k3s
+        state: restarted
+      when: k3s_config is changed and k3s_install is skipped
+
+    - name: Wait for the API server
+      ansible.builtin.command: kubectl get --raw /readyz
+      register: readyz
+      until: readyz.rc == 0
+      retries: 60
+      delay: 5
+      changed_when: false
+
+    # helm is called directly: kubernetes.core.helm does not support Helm 4 yet.
+    - name: Install Cilium
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - cilium
+          - cilium
+          - --repo=https://helm.cilium.io
+          - --version={{ cilium_version }}
+          - --namespace=kube-system
+          - --values={{ repo_root }}/platform/cilium/values.yaml
+          - --set=k8sServiceHost={{ node_ip }}
+          - --set-json=devices={{ [node_iface] | to_json }}
+          - --set-json=ipam.operator.clusterPoolIPv4PodCIDRList={{ [pod_cidr] | to_json }}
+          - --wait
+          - --timeout=10m
+      changed_when: false
+
+    - name: Wait for the node to be Ready
+      ansible.builtin.command: kubectl wait --for=condition=Ready node --all --timeout=300s
+      changed_when: false

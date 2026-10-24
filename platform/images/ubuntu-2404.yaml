@@ -1,0 +1,19 @@
+# Golden Ubuntu 24.04 image, imported once and cloned for every VM.
+# Pinned to a dated build: sha256 04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-2404
+  namespace: vm-images
+  annotations:
+    # Import now instead of waiting for a consumer (local-path is WaitForFirstConsumer).
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+spec:
+  source:
+    http:
+      url: https://cloud-images.ubuntu.com/noble/20261017/noble-server-cloudimg-amd64.img
+  storage:
+    accessModes: [ReadWriteOnce]
+    resources:
+      requests:
+        storage: 10Gi

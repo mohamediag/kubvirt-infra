@@ -1,0 +1,25 @@
+# Site-specific settings of the management host.
+node_ip: 65.21.142.110
+node_iface: enp5s0
+pod_cidr: 10.42.0.0/16
+service_cidr: 10.43.0.0/16
+kubeconfig: /etc/rancher/k3s/k3s.yaml
+
+# Isolated bridge for VMs, NATed to the internet through node_iface.
+# The bridge name is also referenced in platform/vm-network/vm-net.yaml.
+vm_bridge: br-vms
+vm_net_cidr: 192.168.100.0/24
+vm_net_gateway: 192.168.100.1
+vm_net_prefix: 24
+vm_dns: [1.1.1.1, 9.9.9.9]
+
+# Keys injected into VMs: a host-generated key (lets the management host reach
+# the VMs) plus the operator keys already authorized on the host.
+vm_ssh_key: /root/.ssh/vm_ed25519
+vm_authorized_keys_file: /root/.ssh/authorized_keys
+
+# Inbound access to the host itself.
+admin_sources: [94.9.253.229]
+admin_tcp_ports: [22, 80, 443]
+
+apt_upgrade: true

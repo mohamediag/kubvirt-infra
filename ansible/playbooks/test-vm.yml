@@ -1,0 +1,83 @@
+# Creates (state=present, default) or deletes (state=absent) the smoke-test VM.
+- name: Smoke-test VM
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    state: present
+    vm_name: test-vm
+    vm_namespace: vm-test
+    vm_ip: 192.168.100.250
+    vm_mac: "02:00:c0:a8:64:fa"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Delete test VM
+      ansible.builtin.command: kubectl delete -k {{ repo_root }}/vms/test-vm --ignore-not-found --wait=true --timeout=300s
+      when: state == "absent"
+      changed_when: true
+
+    - name: Stop here when deleting
+      ansible.builtin.meta: end_play
+      when: state == "absent"
+
+    - name: Read SSH public keys
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: ["{{ vm_ssh_key }}.pub", "{{ vm_authorized_keys_file }}"]
+      register: keys
+
+    - name: Collect keys
+      ansible.builtin.set_fact:
+        vm_ssh_keys: >-
+          {{ keys.results | map(attribute='content') | map('b64decode')
+             | map('split', '\n') | flatten | map('trim')
+             | select('match', '^(ssh-|ecdsa-|sk-)') | unique | list }}
+
+    - name: Namespace
+      ansible.builtin.command: kubectl apply -f {{ repo_root }}/vms/test-vm/namespace.yaml
+      changed_when: false
+
+    - name: Cloud-init secret
+      ansible.builtin.shell: |
+        kubectl -n {{ vm_namespace }} create secret generic {{ vm_name }}-cloudinit \
+          --from-literal=userdata="$USERDATA" --from-literal=networkdata="$NETWORKDATA" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      environment:
+        USERDATA: "{{ lookup('template', '../templates/cloudinit-userdata.j2') }}"
+        NETWORKDATA: "{{ lookup('template', '../templates/cloudinit-networkdata.j2') }}"
+      changed_when: false
+
+    - name: VM
+      ansible.builtin.command: kubectl apply -k {{ repo_root }}/vms/test-vm
+      changed_when: false
+
+    - name: Wait for the VM to run
+      ansible.builtin.command: kubectl -n {{ vm_namespace }} wait vmi/{{ vm_name }} --for=condition=Ready --timeout=900s
+      register: vmi_wait
+      until: vmi_wait.rc == 0
+      retries: 3
+      delay: 10
+      changed_when: false
+
+    - name: Wait for SSH
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        timeout: 300
+
+    - name: Check the VM over SSH
+      ansible.builtin.command: >-
+        ssh -i {{ vm_ssh_key }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        -o BatchMode=yes ubuntu@{{ vm_ip }}
+        'cloud-init status --wait >/dev/null; hostname; ip -4 -br addr show eth0; curl -fsS -o /dev/null -w "internet: HTTP %{http_code}\n" https://cloud-images.ubuntu.com'
+      register: vm_check
+      retries: 10
+      delay: 15
+      until: vm_check.rc == 0
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ vm_check.stdout_lines }}"

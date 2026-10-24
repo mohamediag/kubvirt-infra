@@ -1,0 +1,12 @@
+version: 2
+ethernets:
+  eth0:
+    match:
+      macaddress: "{{ vm_mac }}"
+    set-name: eth0
+    addresses: [{{ vm_ip }}/{{ vm_net_prefix }}]
+    routes:
+      - to: default
+        via: {{ vm_net_gateway }}
+    nameservers:
+      addresses: {{ vm_dns | to_json }}

@@ -1,0 +1,17 @@
+# Secondary network attaching VMs to the host bridge (see vm_bridge in
+# ansible/group_vars/all/site.yml). No IPAM: VMs get static addresses via
+# cloud-init. Lives in "default" so every namespace can reference it.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: vm-net
+  namespace: default
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "vm-net",
+      "type": "bridge",
+      "bridge": "br-vms",
+      "ipam": {}
+    }

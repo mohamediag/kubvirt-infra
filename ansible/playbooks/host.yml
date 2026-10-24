@@ -1,0 +1,234 @@
+# Prepares the management host: packages, kernel settings, VM bridge + NAT,
+# firewall and CLI tools.
+- name: Prepare management host
+  hosts: all
+  become: true
+  tasks:
+    - name: Upgrade packages
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: "yes"
+      when: apt_upgrade
+
+    - name: Install packages
+      ansible.builtin.apt:
+        name: [curl, jq, nftables, ufw]
+
+    - name: Check whether a reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Warn about pending reboot
+      ansible.builtin.debug:
+        msg: "A reboot is required to finish the upgrade. Reboot the host when convenient."
+      when: reboot_required.stat.exists
+
+    - name: Kernel settings
+      ansible.posix.sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/90-kubevirt-infra.conf
+      loop: "{{ settings | dict2items }}"
+      vars:
+        settings:
+          net.ipv4.ip_forward: 1
+          fs.inotify.max_user_instances: 1024
+          fs.inotify.max_user_watches: 1048576
+
+    # --- VM bridge -------------------------------------------------------
+    - name: VM bridge netdev
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/50-{{ vm_bridge }}.netdev
+        content: |
+          [NetDev]
+          Name={{ vm_bridge }}
+          Kind=bridge
+      notify: Reload networkd
+
+    - name: VM bridge network
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/50-{{ vm_bridge }}.network
+        content: |
+          [Match]
+          Name={{ vm_bridge }}
+
+          [Link]
+          RequiredForOnline=no
+
+          [Network]
+          Address={{ vm_net_gateway }}/{{ vm_net_prefix }}
+          ConfigureWithoutCarrier=yes
+          IgnoreCarrierLoss=yes
+      notify: Reload networkd
+
+    - name: Bring up the VM bridge
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check the VM bridge exists
+      ansible.builtin.command: ip -br addr show {{ vm_bridge }}
+      register: bridge
+      changed_when: false
+      failed_when: false
+
+    - name: Create the VM bridge
+      ansible.builtin.command: networkctl reload
+      when: bridge.rc != 0
+      changed_when: true
+
+    - name: nftables include directory
+      ansible.builtin.file:
+        path: /etc/nftables.d
+        state: directory
+        mode: "0755"
+
+    - name: VM NAT ruleset
+      ansible.builtin.copy:
+        dest: /etc/nftables.d/vm-nat.nft
+        content: |
+          # Managed by kubevirt-infra. Only touches its own table.
+          table ip vm_nat
+          delete table ip vm_nat
+          table ip vm_nat {
+            chain postrouting {
+              type nat hook postrouting priority srcnat; policy accept;
+              ip saddr {{ vm_net_cidr }} oifname "{{ node_iface }}" masquerade
+            }
+          }
+      notify: Restart vm-nat
+
+    - name: VM NAT service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vm-nat.service
+        content: |
+          [Unit]
+          Description=NAT for the KubeVirt VM network
+          After=network-online.target ufw.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/sbin/nft -f /etc/nftables.d/vm-nat.nft
+          ExecStop=/usr/sbin/nft delete table ip vm_nat
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Restart vm-nat
+
+    - name: Enable VM NAT service
+      ansible.builtin.systemd_service:
+        name: vm-nat
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    # --- Firewall --------------------------------------------------------
+    - name: Default policies
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        default: "{{ item.policy }}"
+      loop:
+        - {direction: incoming, policy: deny}
+        - {direction: outgoing, policy: allow}
+        - {direction: routed, policy: deny}
+
+    - name: Admin access
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ item.0 }}"
+        to_port: "{{ item.1 | string }}"
+      loop: "{{ admin_sources | product(admin_tcp_ports) | list }}"
+
+    - name: Cluster networks may reach the host
+      community.general.ufw:
+        rule: allow
+        from_ip: "{{ item }}"
+        comment: kubevirt-infra cluster network
+      loop: ["{{ pod_cidr }}", "{{ service_cidr }}"]
+
+    - name: VMs may reach the internet and each other
+      community.general.ufw:
+        rule: allow
+        route: true
+        interface_in: "{{ vm_bridge }}"
+        interface_out: "{{ item }}"
+        from_ip: "{{ vm_net_cidr }}"
+        comment: kubevirt-infra VM egress
+      loop: ["{{ node_iface }}", "{{ vm_bridge }}"]
+
+    - name: Pods may reach VMs
+      community.general.ufw:
+        rule: allow
+        route: true
+        from_ip: "{{ pod_cidr }}"
+        to_ip: "{{ vm_net_cidr }}"
+        comment: kubevirt-infra pods to VMs
+
+    - name: Enable firewall
+      community.general.ufw:
+        state: enabled
+
+    # --- Tools -----------------------------------------------------------
+    - name: Check installed helm version
+      ansible.builtin.command: /usr/local/bin/helm version --template {% raw %}'{{ .Version }}'{% endraw %}
+      register: helm_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Install helm
+      ansible.builtin.unarchive:
+        src: https://get.helm.sh/helm-{{ helm_version }}-linux-amd64.tar.gz
+        dest: /usr/local/bin
+        remote_src: true
+        include: [linux-amd64/helm]
+        extra_opts: [--strip-components=1]
+      when: helm_installed.stdout != helm_version
+
+    - name: Check installed CNI plugins version
+      ansible.builtin.shell: /opt/cni/bin/bridge --version 2>/dev/null | awk '{print $NF}'
+      register: cni_installed
+      changed_when: false
+
+    - name: CNI plugin directory
+      ansible.builtin.file:
+        path: /opt/cni/bin
+        state: directory
+        mode: "0755"
+
+    - name: Install CNI plugins (bridge etc. for Multus secondary networks)
+      ansible.builtin.unarchive:
+        src: https://github.com/containernetworking/plugins/releases/download/{{ cni_plugins_version }}/cni-plugins-linux-amd64-{{ cni_plugins_version }}.tgz
+        dest: /opt/cni/bin
+        remote_src: true
+      when: cni_installed.stdout != cni_plugins_version
+
+    - name: Install virtctl
+      ansible.builtin.get_url:
+        url: https://github.com/kubevirt/kubevirt/releases/download/{{ kubevirt_version }}/virtctl-{{ kubevirt_version }}-linux-amd64
+        dest: /usr/local/bin/virtctl
+        mode: "0755"
+        force: true
+
+    - name: Export KUBECONFIG for login shells
+      ansible.builtin.copy:
+        dest: /etc/profile.d/kubeconfig.sh
+        content: "export KUBECONFIG={{ kubeconfig }}\n"
+
+    - name: SSH key used by the host to reach VMs
+      community.crypto.openssh_keypair:
+        path: "{{ vm_ssh_key }}"
+        type: ed25519
+        comment: kubevirt-infra@{{ inventory_hostname }}
+
+  handlers:
+    - name: Reload networkd
+      ansible.builtin.command: networkctl reload
+      changed_when: true
+
+    - name: Restart vm-nat
+      ansible.builtin.systemd_service:
+        name: vm-nat
+        state: restarted
+        daemon_reload: true

@@ -1,0 +1,82 @@
+# Installs the platform on top of k3s + Cilium: Multus, KubeVirt, CDI, the VM
+# network, golden images and Crossplane. Every step is idempotent.
+- name: Install platform components
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    platform: "{{ repo_root }}/platform"
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Multus
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/multus
+      changed_when: false
+
+    - name: Wait for Multus
+      ansible.builtin.command: kubectl -n kube-system rollout status ds/kube-multus-ds --timeout=300s
+      changed_when: false
+
+    - name: KubeVirt operator
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/kubevirt/operator
+      changed_when: false
+
+    - name: KubeVirt
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/kubevirt/config
+      changed_when: false
+
+    - name: CDI operator
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/cdi/operator
+      changed_when: false
+
+    - name: CDI
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/cdi/config
+      changed_when: false
+
+    - name: Wait for KubeVirt
+      ansible.builtin.command: kubectl -n kubevirt wait kv/kubevirt --for=condition=Available --timeout=600s
+      changed_when: false
+
+    - name: Wait for CDI
+      ansible.builtin.command: kubectl wait cdi/cdi --for=condition=Available --timeout=600s
+      changed_when: false
+
+    - name: VM network
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/vm-network
+      changed_when: false
+
+    - name: Golden images
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/images
+      changed_when: false
+
+    - name: Crossplane
+      ansible.builtin.command:
+        argv:
+          - helm
+          - upgrade
+          - --install
+          - crossplane
+          - crossplane
+          - --repo=https://charts.crossplane.io/stable
+          - --version={{ crossplane_version }}
+          - --namespace=crossplane-system
+          - --create-namespace
+          - --values={{ platform }}/crossplane/values.yaml
+          - --wait
+          - --timeout=10m
+      changed_when: false
+
+    - name: Crossplane functions and RBAC
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/crossplane
+      changed_when: false
+
+    - name: Wait for Crossplane functions
+      ansible.builtin.command: kubectl wait function --all --for=condition=Healthy --timeout=300s
+      changed_when: false
+
+    - name: Wait for golden images
+      ansible.builtin.command: >-
+        kubectl -n vm-images wait dv --all
+        --for=jsonpath='{.status.phase}'=Succeeded --timeout=1200s
+      changed_when: false

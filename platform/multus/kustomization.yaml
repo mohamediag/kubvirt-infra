@@ -1,0 +1,17 @@
+# Multus (thick plugin). Delegate plugins such as bridge come from the
+# upstream CNI plugins installed in /opt/cni/bin by ansible/playbooks/host.yml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - upstream/multus-daemonset-thick.yaml
+patches:
+  # The upstream 50Mi limit is known to OOM.
+  - target:
+      kind: DaemonSet
+      name: kube-multus-ds
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: {cpu: 100m, memory: 64Mi}
+          limits: {memory: 512Mi}

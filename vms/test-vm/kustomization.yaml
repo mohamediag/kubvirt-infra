@@ -1,0 +1,8 @@
+# Smoke-test VM: proves image cloning, the VM bridge network, static IPs and
+# SSH work. Its cloud-init secret is created by ansible/playbooks/test-vm.yml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: vm-test
+resources:
+  - namespace.yaml
+  - vm.yaml

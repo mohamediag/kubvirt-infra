@@ -1,0 +1,14 @@
+#cloud-config
+hostname: {{ vm_name }}
+ssh_pwauth: false
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+{% for key in vm_ssh_keys %}
+      - {{ key }}
+{% endfor %}
+packages: [qemu-guest-agent]
+runcmd:
+  - systemctl enable --now qemu-guest-agent

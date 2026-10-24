@@ -1,0 +1,55 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: test-vm
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    - metadata:
+        name: test-vm-root
+      spec:
+        source:
+          pvc:
+            namespace: vm-images
+            name: ubuntu-2404
+        storage:
+          accessModes: [ReadWriteOnce]
+          resources:
+            requests:
+              storage: 20Gi
+  template:
+    metadata:
+      labels:
+        kubevirt.io/vm: test-vm
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        memory:
+          guest: 2Gi
+        devices:
+          disks:
+            - name: root
+              disk: {bus: virtio}
+            - name: cloudinit
+              disk: {bus: virtio}
+          interfaces:
+            - name: vmnet
+              bridge: {}
+              macAddress: "02:00:c0:a8:64:fa"
+      # Only the bridge network is listed, so the VM has a single NIC on
+      # br-vms. The launcher pod itself keeps its Cilium pod network.
+      networks:
+        - name: vmnet
+          multus:
+            networkName: default/vm-net
+      volumes:
+        - name: root
+          dataVolume:
+            name: test-vm-root
+        - name: cloudinit
+          cloudInitNoCloud:
+            secretRef:
+              name: test-vm-cloudinit
+            networkDataSecretRef:
+              name: test-vm-cloudinit

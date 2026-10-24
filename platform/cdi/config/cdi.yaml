@@ -1,0 +1,11 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: CDI
+metadata:
+  name: cdi
+spec:
+  imagePullPolicy: IfNotPresent
+  config:
+    # Keep completed DataVolumes so the manifests that created them stay in sync.
+    dataVolumeTTLSeconds: -1
+    featureGates:
+      - HonorWaitForFirstConsumer

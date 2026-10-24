@@ -1,0 +1,10 @@
+# Pinned component versions. After changing an upstream manifest version,
+# run `make vendor` to refresh platform/*/upstream.
+k3s_version: v1.36.5+k3s1
+helm_version: v4.3.1
+cni_plugins_version: v1.9.1
+cilium_version: 1.20.4
+multus_version: v4.3.1
+kubevirt_version: v1.9.1
+cdi_version: v1.66.1
+crossplane_version: 2.4.3

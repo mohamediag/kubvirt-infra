@@ -1,0 +1,28 @@
+# Cilium on single-node k3s. Host-specific values (API endpoint, device,
+# pod CIDR) are set by ansible/playbooks/k3s.yml from group_vars.
+kubeProxyReplacement: true
+k8sServicePort: 6443
+
+ipam:
+  mode: cluster-pool
+  operator:
+    clusterPoolIPv4MaskSize: 24
+
+operator:
+  replicas: 1
+
+# With flannel disabled, k3s's containerd uses the standard CNI paths
+# (/etc/cni/net.d, /opt/cni/bin).
+cni:
+  # Leave other CNI configs alone so Multus can chain secondary networks.
+  exclusive: false
+
+# Recommended for KubeVirt: keep socket-level LB out of pod/VM namespaces.
+socketLB:
+  hostNamespaceOnly: true
+
+hubble:
+  relay:
+    enabled: true
+  ui:
+    enabled: true

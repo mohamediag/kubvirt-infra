@@ -1,0 +1,24 @@
+# Crossplane composes KubeVirt/CDI objects directly (no provider needed),
+# so its service account must be allowed to manage them.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crossplane-compose-kubevirt
+  labels:
+    rbac.crossplane.io/aggregate-to-crossplane: "true"
+rules:
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines]
+    verbs: ["*"]
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [get, list, watch]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes]
+    verbs: ["*"]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes/source]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets, configmaps, services]
+    verbs: ["*"]
