@@ -5,13 +5,22 @@ pod_cidr: 10.42.0.0/16
 service_cidr: 10.43.0.0/16
 kubeconfig: /etc/rancher/k3s/k3s.yaml
 
-# Isolated bridge for VMs, NATed to the internet through node_iface.
-# The bridge name is also referenced in platform/vm-network/vm-net.yaml.
+# VLAN-aware bridge for VMs, NATed to the internet through node_iface.
+# The bridge name is also referenced in platform/vm-network/vm-net.yaml and
+# crossplane/composition.yaml.
 vm_bridge: br-vms
+# Untagged network (smoke-test VM).
 vm_net_cidr: 192.168.100.0/24
 vm_net_gateway: 192.168.100.1
 vm_net_prefix: 24
 vm_dns: [1.1.1.1, 9.9.9.9]
+
+# One VLAN per workload cluster. The host owns .1 of each subnet as gateway.
+# Must match spec.network of the cluster in clusters/<name>/cluster.yaml
+# (checked by `make clusters`).
+vm_vlans:
+  - {id: 110, name: cluster-a, cidr: 192.168.110.0/24}
+  - {id: 120, name: cluster-b, cidr: 192.168.120.0/24}
 
 # Keys injected into VMs: a host-generated key (lets the management host reach
 # the VMs) plus the operator keys already authorized on the host.

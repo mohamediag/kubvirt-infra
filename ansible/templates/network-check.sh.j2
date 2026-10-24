@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs on {{ src.name }}'s control plane. Prints PASS/FAIL per expectation.
+check() {
+  want=$1; desc=$2; shift 2
+  if "$@" >/dev/null 2>&1; then got=reachable; else got=blocked; fi
+  if [ "$got" = "$want" ]; then echo "PASS $desc: $got"; else echo "FAIL $desc: want $want, got $got"; fi
+}
+check reachable "internet (https://cloud-images.ubuntu.com)" curl -fsS -m 10 -o /dev/null https://cloud-images.ubuntu.com
+{% for peer in peers %}
+check reachable "{{ peer.name }} node {{ peer.cp }}:6443" nc -z -w 3 {{ peer.cp }} 6443
+check reachable "{{ peer.name }} LoadBalancer http://{{ peer.lb }}" curl -fsS -m 5 -o /dev/null http://{{ peer.lb }}
+{% endfor %}
+check blocked "host {{ node_ip }}:22" nc -z -w 3 {{ node_ip }} 22
+check blocked "host gateway {{ src.gateway }}:22" nc -z -w 3 {{ src.gateway }} 22
+check blocked "management API {{ node_ip }}:6443" nc -z -w 3 {{ node_ip }} 6443
+check blocked "management service network {{ service_cidr | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}:53" nc -z -w 3 {{ service_cidr | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }} 53

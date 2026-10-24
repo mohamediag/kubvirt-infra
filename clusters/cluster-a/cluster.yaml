@@ -1,0 +1,27 @@
+# spec.sshAuthorizedKeys is added by ansible/playbooks/clusters.yml.
+apiVersion: platform.kubvirt-infra.io/v1alpha1
+kind: KubernetesCluster
+metadata:
+  name: cluster-a
+  namespace: cluster-a
+spec:
+  running: true
+  network:
+    vlanId: 110
+    subnet: 192.168.110.0/24
+    nodeIPStart: 10
+    loadBalancerRange: {start: 200, stop: 220}
+    podCIDR: 10.110.0.0/16
+    serviceCIDR: 10.111.0.0/16
+  cilium:
+    clusterId: 1
+  controlPlane:
+    replicas: 1
+    cpu: 2
+    memory: 4Gi
+    diskSize: 20Gi
+  workers:
+    replicas: 2
+    cpu: 4
+    memory: 8Gi
+    diskSize: 40Gi

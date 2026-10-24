@@ -37,6 +37,13 @@
           fs.inotify.max_user_watches: 1048576
 
     # --- VM bridge -------------------------------------------------------
+    # br-vms is VLAN-aware: each VM port is an access port of its cluster's
+    # VLAN; the host has one gateway interface (br-vms.<id>) per VLAN.
+    - name: VM networks (untagged + one per VLAN)
+      ansible.builtin.set_fact:
+        vm_networks: "{{ vm_networks | default([{'iface': vm_bridge, 'cidr': vm_net_cidr}]) + [{'iface': vm_bridge ~ '.' ~ item.id, 'cidr': item.cidr}] }}"
+      loop: "{{ vm_vlans }}"
+
     - name: VM bridge netdev
       ansible.builtin.copy:
         dest: /etc/systemd/network/50-{{ vm_bridge }}.netdev
@@ -44,6 +51,10 @@
           [NetDev]
           Name={{ vm_bridge }}
           Kind=bridge
+
+          [Bridge]
+          VLANFiltering=yes
+          DefaultPVID=1
       notify: Reload networkd
 
     - name: VM bridge network
@@ -60,6 +71,65 @@
           Address={{ vm_net_gateway }}/{{ vm_net_prefix }}
           ConfigureWithoutCarrier=yes
           IgnoreCarrierLoss=yes
+          {% for vlan in vm_vlans %}
+          VLAN={{ vm_bridge }}.{{ vlan.id }}
+          {% endfor %}
+
+          # Bridge "self" port: untagged network on PVID 1, tagged member of
+          # every cluster VLAN so the gateway interfaces see their traffic.
+          [BridgeVLAN]
+          VLAN=1
+          PVID=1
+          EgressUntagged=1
+          {% for vlan in vm_vlans %}
+
+          [BridgeVLAN]
+          VLAN={{ vlan.id }}
+          {% endfor %}
+      notify: Reload networkd
+
+    - name: VLAN gateway netdevs
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/51-{{ vm_bridge }}.{{ item.id }}.netdev
+        content: |
+          [NetDev]
+          Name={{ vm_bridge }}.{{ item.id }}
+          Kind=vlan
+
+          [VLAN]
+          Id={{ item.id }}
+      loop: "{{ vm_vlans }}"
+      notify: Reload networkd
+
+    - name: VLAN gateway networks
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/51-{{ vm_bridge }}.{{ item.id }}.network
+        content: |
+          # {{ item.name }}
+          [Match]
+          Name={{ vm_bridge }}.{{ item.id }}
+
+          [Link]
+          RequiredForOnline=no
+
+          [Network]
+          Address={{ item.cidr | ansible.utils.ipaddr('1') }}
+          ConfigureWithoutCarrier=yes
+          IgnoreCarrierLoss=yes
+      loop: "{{ vm_vlans }}"
+      notify: Reload networkd
+
+    # networkd does not change bridge options of an existing bridge.
+    - name: Check VLAN filtering on the VM bridge
+      ansible.builtin.slurp:
+        src: /sys/class/net/{{ vm_bridge }}/bridge/vlan_filtering
+      register: vlan_filtering
+      failed_when: false
+
+    - name: Recreate the VM bridge with VLAN filtering
+      ansible.builtin.command: ip link delete {{ vm_bridge }}
+      when: (vlan_filtering.content | default('') | b64decode | trim) == '0'
+      changed_when: true
       notify: Reload networkd
 
     - name: Bring up the VM bridge
@@ -92,7 +162,8 @@
           table ip vm_nat {
             chain postrouting {
               type nat hook postrouting priority srcnat; policy accept;
-              ip saddr {{ vm_net_cidr }} oifname "{{ node_iface }}" masquerade
+              # Only traffic leaving the host; VLAN-to-VLAN traffic is routed as is.
+              ip saddr { {{ vm_networks | map(attribute='cidr') | join(', ') }} } oifname "{{ node_iface }}" masquerade
             }
           }
       notify: Restart vm-nat
@@ -148,23 +219,57 @@
         comment: kubevirt-infra cluster network
       loop: ["{{ pod_cidr }}", "{{ service_cidr }}"]
 
-    - name: VMs may reach the internet and each other
+    # VMs never reach the host itself (incoming default deny) nor the
+    # management cluster's pod/service networks.
+    - name: VMs may not reach management cluster networks
+      community.general.ufw:
+        rule: deny
+        route: true
+        insert: 1
+        from_ip: "{{ item.0.cidr }}"
+        to_ip: "{{ item.1 }}"
+        comment: kubevirt-infra VMs to mgmt
+      loop: "{{ vm_networks | product([pod_cidr, service_cidr]) | list }}"
+
+    - name: VMs may reach the internet
+      community.general.ufw:
+        rule: allow
+        route: true
+        interface_in: "{{ item.iface }}"
+        interface_out: "{{ node_iface }}"
+        from_ip: "{{ item.cidr }}"
+        comment: kubevirt-infra VM egress
+      loop: "{{ vm_networks }}"
+
+    # br_netfilter passes bridged frames through FORWARD as well.
+    - name: VMs in the same network may reach each other
       community.general.ufw:
         rule: allow
         route: true
         interface_in: "{{ vm_bridge }}"
-        interface_out: "{{ item }}"
-        from_ip: "{{ vm_net_cidr }}"
+        interface_out: "{{ vm_bridge }}"
+        from_ip: "{{ item.cidr }}"
         comment: kubevirt-infra VM egress
-      loop: ["{{ node_iface }}", "{{ vm_bridge }}"]
+      loop: "{{ vm_networks }}"
+
+    - name: VMs in different VLANs may reach each other
+      community.general.ufw:
+        rule: allow
+        route: true
+        from_ip: "{{ item.0 }}"
+        to_ip: "{{ item.1 }}"
+        comment: kubevirt-infra inter-VLAN
+      loop: "{{ vm_vlans | map(attribute='cidr') | product(vm_vlans | map(attribute='cidr')) | list }}"
+      when: item.0 != item.1
 
     - name: Pods may reach VMs
       community.general.ufw:
         rule: allow
         route: true
         from_ip: "{{ pod_cidr }}"
-        to_ip: "{{ vm_net_cidr }}"
+        to_ip: "{{ item.cidr }}"
         comment: kubevirt-infra pods to VMs
+      loop: "{{ vm_networks }}"
 
     - name: Enable firewall
       community.general.ufw:
@@ -224,7 +329,7 @@
 
   handlers:
     - name: Reload networkd
-      ansible.builtin.command: networkctl reload
+      ansible.builtin.shell: networkctl reload && networkctl reconfigure {{ vm_bridge }}
       changed_when: true
 
     - name: Restart vm-nat

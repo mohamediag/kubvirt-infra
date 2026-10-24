@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cluster-a
+---
+# Caps what this cluster's VMs (incl. KubeVirt overhead) can request.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: cluster-a
+  namespace: cluster-a
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 24Gi
+    requests.storage: 200Gi
+    persistentvolumeclaims: "10"

@@ -1,0 +1,98 @@
+# Verifies workload-cluster networking from every cluster's control plane:
+# internet and other clusters (nodes + LoadBalancer IPs) reachable; the host and
+# the management cluster's networks blocked.
+- name: Workload cluster network test
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    ssh: >-
+      ssh -i {{ vm_ssh_key }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o BatchMode=yes -o ConnectTimeout=5
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Find cluster definitions
+      ansible.builtin.find:
+        paths: "{{ repo_root }}/clusters"
+        patterns: cluster.yaml
+        recurse: true
+      register: cluster_files
+
+    - name: Describe clusters
+      ansible.builtin.set_fact:
+        clusters: "{{ clusters | default([]) + [{'name': xr.metadata.name, 'namespace': xr.metadata.namespace,
+                       'cp': prefix ~ '.' ~ (xr.spec.network.nodeIPStart | default(10)),
+                       'gateway': prefix ~ '.1',
+                       'kubeconfig': '/root/.kube/' ~ xr.metadata.name ~ '.kubeconfig'}] }}"
+      vars:
+        xr: "{{ lookup('file', item.path) | from_yaml }}"
+        prefix: "{{ xr.spec.network.subnet | regex_replace('\\.0/24$', '') }}"
+      loop: "{{ cluster_files.files | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | dirname | basename }}"
+
+    - name: Fetch kubeconfigs
+      ansible.builtin.shell: |
+        umask 077; mkdir -p /root/.kube
+        kubectl -n {{ item.namespace }} get secret {{ item.name }}-kubeconfig -o jsonpath='{.data.kubeconfig}' | base64 -d > {{ item.kubeconfig }}
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Deploy a test LoadBalancer service in each cluster
+      ansible.builtin.shell: |
+        kubectl --kubeconfig {{ item.kubeconfig }} create namespace network-test --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
+        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test create deployment echo --image=nginx:1.27-alpine --port=80 --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
+        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test expose deployment echo --type=LoadBalancer --port=80 --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
+        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test rollout status deployment/echo --timeout=300s >/dev/null
+        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test wait svc/echo --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' --timeout=120s >/dev/null
+        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: lb
+      changed_when: false
+
+    - name: Record LoadBalancer IPs
+      ansible.builtin.set_fact:
+        with_lb: "{{ with_lb | default([]) + [item.0 | combine({'lb': item.1.stdout_lines | last})] }}"
+      loop: "{{ clusters | zip(lb.results) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+
+    - name: Use clusters with LoadBalancer IPs
+      ansible.builtin.set_fact:
+        clusters: "{{ with_lb }}"
+
+    - name: Run checks from each control plane
+      ansible.builtin.shell: "{{ ssh }} ubuntu@{{ src.cp }} sh -s"
+      args:
+        stdin: "{{ lookup('template', '../templates/network-check.sh.j2') }}"
+      vars:
+        src: "{{ item }}"
+        peers: "{{ clusters | rejectattr('name', 'equalto', item.name) | list }}"
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: checks
+      changed_when: false
+
+    - name: Results
+      ansible.builtin.debug:
+        msg: "{{ checks.results | map(attribute='stdout_lines') | zip(clusters | map(attribute='name')) | map('reverse') | community.general.dict }}"
+
+    - name: Remove test services
+      ansible.builtin.command: kubectl --kubeconfig {{ item.kubeconfig }} delete namespace network-test --wait=false
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: All checks passed
+      ansible.builtin.assert:
+        that: checks.results | map(attribute='stdout') | select('search', 'FAIL') | list | length == 0
+        fail_msg: Some network checks failed, see Results above.
+        quiet: true

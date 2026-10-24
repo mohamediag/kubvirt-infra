@@ -1,0 +1,158 @@
+# KubernetesCluster: a k3s + Cilium cluster on KubeVirt VMs in its own VLAN.
+# Implemented by crossplane/composition.yaml.
+apiVersion: apiextensions.crossplane.io/v2
+kind: CompositeResourceDefinition
+metadata:
+  name: kubernetesclusters.platform.kubvirt-infra.io
+spec:
+  scope: Namespaced
+  group: platform.kubvirt-infra.io
+  names:
+    kind: KubernetesCluster
+    plural: kubernetesclusters
+  defaultCompositionRef:
+    name: kubernetescluster-kubevirt-k3s
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Endpoint
+          type: string
+          jsonPath: .status.apiEndpoint
+        - name: Nodes
+          type: string
+          jsonPath: .status.nodes.summary
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [network, cilium, sshAuthorizedKeys]
+              x-kubernetes-validations:
+                - rule: >-
+                    self.network.nodeIPStart + self.controlPlane.replicas + self.workers.replicas - 1 < self.network.loadBalancerRange.start
+                    || self.network.nodeIPStart > self.network.loadBalancerRange.stop
+                  message: node IPs must not overlap network.loadBalancerRange
+                - rule: self.network.nodeIPStart + self.controlPlane.replicas + self.workers.replicas - 1 <= 254
+                  message: node IPs must fit in network.subnet
+              properties:
+                running:
+                  type: boolean
+                  default: true
+                  description: false stops all VMs and keeps their disks.
+                k3sVersion:
+                  type: string
+                  default: v1.36.5+k3s1
+                network:
+                  type: object
+                  required: [vlanId, subnet, podCIDR, serviceCIDR]
+                  x-kubernetes-validations:
+                    - rule: self.loadBalancerRange.start <= self.loadBalancerRange.stop
+                      message: loadBalancerRange.start must be <= stop
+                  properties:
+                    vlanId:
+                      type: integer
+                      minimum: 2
+                      maximum: 4094
+                      description: Must be listed in vm_vlans of ansible/group_vars/all/site.yml.
+                      x-kubernetes-validations:
+                        - {rule: self == oldSelf, message: vlanId is immutable}
+                    subnet:
+                      type: string
+                      description: The VLAN's /24. The host is the gateway on .1.
+                      x-kubernetes-validations:
+                        - rule: isCIDR(self) && cidr(self).ip().family() == 4 && cidr(self).prefixLength() == 24 && cidr(self).masked() == cidr(self)
+                          message: subnet must be an IPv4 network address with prefix /24, e.g. 192.168.110.0/24
+                        - {rule: self == oldSelf, message: subnet is immutable}
+                    nodeIPStart:
+                      type: integer
+                      default: 10
+                      minimum: 2
+                      maximum: 254
+                      description: Host part of the first node IP (control plane), workers follow.
+                      x-kubernetes-validations:
+                        - {rule: self == oldSelf, message: nodeIPStart is immutable}
+                    loadBalancerRange:
+                      type: object
+                      default: {start: 200, stop: 220}
+                      description: Host parts of the Cilium LoadBalancer IP pool in the subnet.
+                      properties:
+                        start: {type: integer, minimum: 2, maximum: 254, default: 200}
+                        stop: {type: integer, minimum: 2, maximum: 254, default: 220}
+                    podCIDR:
+                      type: string
+                      x-kubernetes-validations:
+                        - {rule: isCIDR(self), message: podCIDR must be a CIDR}
+                        - {rule: self == oldSelf, message: podCIDR is immutable}
+                    serviceCIDR:
+                      type: string
+                      x-kubernetes-validations:
+                        - {rule: isCIDR(self), message: serviceCIDR must be a CIDR}
+                        - {rule: self == oldSelf, message: serviceCIDR is immutable}
+                    dns:
+                      type: array
+                      items: {type: string}
+                      default: [1.1.1.1, 9.9.9.9]
+                      description: Upstream DNS servers for the nodes.
+                cilium:
+                  type: object
+                  required: [clusterId]
+                  properties:
+                    version:
+                      type: string
+                      default: 1.20.4
+                    clusterId:
+                      type: integer
+                      minimum: 1
+                      maximum: 255
+                      description: Unique per cluster (Cilium Cluster Mesh).
+                      x-kubernetes-validations:
+                        - {rule: self == oldSelf, message: clusterId is immutable}
+                controlPlane:
+                  type: object
+                  default: {}
+                  properties:
+                    replicas:
+                      type: integer
+                      default: 1
+                      enum: [1]
+                      description: Only 1 for now; HA control planes come later.
+                    cpu: {type: integer, minimum: 1, maximum: 16, default: 2}
+                    memory: {type: string, default: 4Gi}
+                    diskSize: {type: string, default: 20Gi}
+                workers:
+                  type: object
+                  default: {}
+                  properties:
+                    replicas: {type: integer, minimum: 0, maximum: 8, default: 2}
+                    cpu: {type: integer, minimum: 1, maximum: 16, default: 4}
+                    memory: {type: string, default: 8Gi}
+                    diskSize: {type: string, default: 40Gi}
+                sshAuthorizedKeys:
+                  type: array
+                  minItems: 1
+                  items: {type: string}
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  description: Provisioning, Ready or Stopped.
+                apiEndpoint:
+                  type: string
+                kubeconfigSecretRef:
+                  type: object
+                  properties:
+                    name: {type: string}
+                    key: {type: string}
+                nodes:
+                  type: object
+                  properties:
+                    desired: {type: integer}
+                    running: {type: integer}
+                    summary: {type: string}

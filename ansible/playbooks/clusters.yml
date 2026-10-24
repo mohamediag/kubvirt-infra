@@ -1,0 +1,128 @@
+# Installs the KubernetesCluster API and applies every clusters/<name>/ definition
+# (state=present, default), or deletes all workload clusters (state=absent).
+- name: Workload clusters
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    repo_root: "{{ playbook_dir }}/../.."
+    state: present
+    ready_timeout: 1800s
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+  tasks:
+    - name: Find cluster definitions
+      ansible.builtin.find:
+        paths: "{{ repo_root }}/clusters"
+        patterns: cluster.yaml
+        recurse: true
+      register: cluster_files
+
+    - name: Load cluster definitions
+      ansible.builtin.set_fact:
+        clusters: "{{ clusters | default([]) + [{'dir': item.path | dirname, 'xr': lookup('file', item.path) | from_yaml}] }}"
+      loop: "{{ cluster_files.files | sort(attribute='path') }}"
+      loop_control:
+        label: "{{ item.path | dirname | basename }}"
+
+    - name: Delete clusters
+      when: state == "absent"
+      block:
+        - name: Delete KubernetesClusters
+          ansible.builtin.command: >-
+            kubectl -n {{ item.xr.metadata.namespace }} delete kubernetescluster {{ item.xr.metadata.name }}
+            --ignore-not-found --wait=true --timeout=600s
+          loop: "{{ clusters }}"
+          loop_control:
+            label: "{{ item.xr.metadata.name }}"
+          changed_when: true
+
+        - name: Delete cluster namespaces
+          ansible.builtin.command: kubectl delete -f {{ item.dir }}/namespace.yaml --ignore-not-found --wait=true --timeout=600s
+          loop: "{{ clusters }}"
+          loop_control:
+            label: "{{ item.xr.metadata.name }}"
+          changed_when: true
+
+        - name: Stop here when deleting
+          ansible.builtin.meta: end_play
+
+    - name: Each cluster's VLAN must exist on the host (site.yml vm_vlans)
+      ansible.builtin.assert:
+        that:
+          - vlan | length == 1
+          - vlan[0].cidr == item.xr.spec.network.subnet
+        fail_msg: >-
+          {{ item.xr.metadata.name }}: VLAN {{ item.xr.spec.network.vlanId }} / {{ item.xr.spec.network.subnet }}
+          is not in vm_vlans. Add it to ansible/group_vars/all/site.yml and run `make host`.
+        quiet: true
+      vars:
+        vlan: "{{ vm_vlans | selectattr('id', 'equalto', item.xr.spec.network.vlanId) | list }}"
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+
+    - name: KubernetesCluster API
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ repo_root }}/crossplane
+      changed_when: false
+
+    - name: Wait for the API to be established
+      ansible.builtin.command: kubectl wait xrd/kubernetesclusters.platform.kubvirt-infra.io --for=condition=Established --timeout=300s
+      changed_when: false
+
+    - name: Read SSH public keys
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop: ["{{ vm_ssh_key }}.pub", "{{ vm_authorized_keys_file }}"]
+      register: keys
+
+    - name: Collect keys
+      ansible.builtin.set_fact:
+        vm_ssh_keys: >-
+          {{ keys.results | map(attribute='content') | map('b64decode')
+             | map('split', '\n') | flatten | map('trim')
+             | select('match', '^(ssh-|ecdsa-|sk-)') | unique | list }}
+
+    - name: Namespaces and quotas
+      ansible.builtin.command: kubectl apply --server-side -f {{ item.dir }}/namespace.yaml
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    # Lets the kubeconfig Job SSH to the control plane. Never committed.
+    - name: SSH key for the kubeconfig Job
+      ansible.builtin.shell: |
+        kubectl -n {{ item.xr.metadata.namespace }} create secret generic vm-ssh-key \
+          --from-file=id_ed25519={{ vm_ssh_key }} --dry-run=client -o yaml | kubectl apply --server-side -f -
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    - name: Clusters
+      ansible.builtin.command:
+        cmd: kubectl apply --server-side -f -
+        stdin: "{{ item.xr | combine({'spec': {'sshAuthorizedKeys': vm_ssh_keys}}, recursive=true) | to_json }}"
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    - name: Wait for the clusters to be Ready
+      ansible.builtin.command: >-
+        kubectl -n {{ item.xr.metadata.namespace }} wait kubernetescluster/{{ item.xr.metadata.name }}
+        --for=condition=Ready --timeout={{ ready_timeout }}
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    - name: Status
+      ansible.builtin.command: kubectl get kubernetescluster -A
+      register: xr_status
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg: "{{ xr_status.stdout_lines }}"
