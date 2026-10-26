@@ -8,6 +8,7 @@ VMs through a Crossplane API, one VLAN per cluster.
                        Hetzner host (Ubuntu 26.04, enp5s0)
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │  k3s (embedded etcd) ─ Cilium CNI + kube-proxy replacement + Hubble          │
+│   ├─ Gateway API (Cilium, host network) ─ Gateway gateway/homelab on :80     │
 │   ├─ Multus, KubeVirt + CDI ─ golden image vm-images/ubuntu-2404             │
 │   └─ Crossplane 2 ─ KubernetesCluster API (crossplane/)                      │
 │                                                                              │
@@ -38,8 +39,8 @@ target converges the host back to the code.
 | Target | What it does |
 |---|---|
 | `host` | Package upgrades, sysctls, CNI plugins, VM bridge `br-vms`, NAT (`vm-nat.service`), UFW rules, helm/virtctl, host SSH key for VMs |
-| `k3s` | k3s with `ansible/templates/k3s-config.yaml.j2` (no flannel, kube-proxy, traefik, servicelb) and Cilium |
-| `platform` | Multus, KubeVirt, CDI, VM network, golden image, Crossplane + functions + RBAC |
+| `k3s` | k3s with `ansible/templates/k3s-config.yaml.j2` (no flannel, kube-proxy, traefik, servicelb), Gateway API CRDs and Cilium |
+| `platform` | Multus, KubeVirt, CDI, VM network, golden image, Crossplane + functions + RBAC, Gateway |
 | `vendor` | Re-download pinned upstream manifests into `platform/*/upstream` |
 | `validate` | Render every kustomization without touching the cluster |
 | `crossplane-api` | Apply the `KubernetesCluster` XRD + Composition only |
@@ -59,6 +60,8 @@ ansible/
   templates/                    k3s config, cloud-init user/network data, network check
 platform/
   cilium/values.yaml            Helm values
+  gateway-api/                  vendored Gateway API CRDs (standard channel)
+  gateway/                      shared Gateway (HTTP :80)
   multus/                       vendored thick-plugin manifest + patches
   kubevirt/{operator,config}/   vendored operator + KubeVirt CR
   cdi/{operator,config}/        vendored operator + CDI CR
@@ -91,7 +94,12 @@ spec:
   workers: {replicas: 2, cpu: 4, memory: 8Gi, diskSize: 40Gi}
 ```
 
-`kubectl get kubernetescluster -A` shows phase, API endpoint and nodes. The
+`kubectl get kubernetescluster -A` shows phase, API endpoint and nodes.
+`make clusters` writes each kubeconfig to `/root/.kube/<name>.kubeconfig` and
+merges them with the management cluster's into `/root/.kube/config` (login
+shells' `KUBECONFIG`), so `kubectx cluster-a` / `kubectl --context cluster-a`
+work; the management context is `default`. `kubeconfig-merge.path` rebuilds the
+file when k3s rewrites `/etc/rancher/k3s/k3s.yaml`. The
 composition (`crossplane/composition.yaml`, function-go-templating) creates, in
 the cluster's namespace:
 
@@ -113,6 +121,26 @@ Scaling `workers.replicas` (0-8) is supported.
 
 **Adding a cluster:** add its VLAN to `vm_vlans` in `site.yml`, `make host`,
 add `clusters/<name>/{namespace,cluster}.yaml`, `make clusters`.
+
+## Exposing apps (Gateway API)
+
+Cilium implements Gateway API in **host network mode**: Envoy listens on the
+host's port 80 for `Gateway gateway/homelab`, so UFW applies (only
+`admin_sources` can connect; VMs cannot). An app is exposed with an
+`HTTPRoute` in its own namespace:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: my-app, namespace: my-app}
+spec:
+  parentRefs: [{name: homelab, namespace: gateway, sectionName: http}]
+  hostnames: [my-app.homelab.local]
+  rules: [{backendRefs: [{name: my-app, port: 8080}]}]
+```
+
+`*.homelab.local` is not in public DNS: add `<node_ip>  my-app.homelab.local`
+to `/etc/hosts` on the workstation.
 
 ## Versions
 
@@ -148,6 +176,7 @@ Ubuntu image build (`platform/images/ubuntu-2404.yaml`).
 
 * Nothing secret is committed. Kubeconfigs, private keys and cloud-init secrets
   are generated on the host (see `.gitignore`).
+* Expose HTTP apps through the Gateway (above), not Services.
 * Cilium's kube-proxy replacement handles NodePort/LoadBalancer traffic in eBPF
   **before UFW sees it**. Do not create NodePort or LoadBalancer services on the
   management cluster unless they are meant to be public.

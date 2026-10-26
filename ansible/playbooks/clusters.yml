@@ -44,6 +44,18 @@
             label: "{{ item.xr.metadata.name }}"
           changed_when: true
 
+        - name: Remove kubeconfigs
+          ansible.builtin.file:
+            path: /root/.kube/{{ item.xr.metadata.name }}.kubeconfig
+            state: absent
+          loop: "{{ clusters }}"
+          loop_control:
+            label: "{{ item.xr.metadata.name }}"
+
+        - name: Rebuild the merged kubeconfig
+          ansible.builtin.command: /usr/local/bin/kubeconfig-merge
+          changed_when: true
+
         - name: Stop here when deleting
           ansible.builtin.meta: end_play
 
@@ -116,6 +128,19 @@
       loop: "{{ clusters }}"
       loop_control:
         label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    - name: Write kubeconfigs to /root/.kube/<cluster>.kubeconfig
+      ansible.builtin.shell: |
+        umask 077; mkdir -p /root/.kube
+        kubectl -n {{ item.xr.metadata.namespace }} get secret {{ item.xr.metadata.name }}-kubeconfig -o jsonpath='{.data.kubeconfig}' | base64 -d > /root/.kube/{{ item.xr.metadata.name }}.kubeconfig
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.xr.metadata.name }}"
+      changed_when: false
+
+    - name: Merge them into /root/.kube/config (see host.yml)
+      ansible.builtin.command: /usr/local/bin/kubeconfig-merge
       changed_when: false
 
     - name: Status

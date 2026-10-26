@@ -4,6 +4,8 @@ node_iface: enp5s0
 pod_cidr: 10.42.0.0/16
 service_cidr: 10.43.0.0/16
 kubeconfig: /etc/rancher/k3s/k3s.yaml
+# Management + workload clusters, for kubectl/kubectx in login shells.
+merged_kubeconfig: /root/.kube/config
 
 # VLAN-aware bridge for VMs, NATed to the internet through node_iface.
 # The bridge name is also referenced in platform/vm-network/vm-net.yaml and

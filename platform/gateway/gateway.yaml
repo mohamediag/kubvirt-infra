@@ -1,0 +1,22 @@
+# Shared HTTP entry point of the management cluster. Cilium host network mode:
+# Envoy listens on :80 of the host, reachable from admin_sources only (UFW).
+# Apps attach an HTTPRoute with their hostname from any namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: homelab
+  namespace: gateway
+spec:
+  gatewayClassName: cilium
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All

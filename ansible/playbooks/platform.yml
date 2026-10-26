@@ -1,5 +1,5 @@
 # Installs the platform on top of k3s + Cilium: Multus, KubeVirt, CDI, the VM
-# network, golden images and Crossplane. Every step is idempotent.
+# network, golden images, Crossplane and the Gateway. Every step is idempotent.
 - name: Install platform components
   hosts: all
   become: true
@@ -69,6 +69,14 @@
 
     - name: Crossplane functions and RBAC
       ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/crossplane
+      changed_when: false
+
+    - name: Gateway
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ platform }}/gateway
+      changed_when: false
+
+    - name: Wait for the Gateway
+      ansible.builtin.command: kubectl -n gateway wait gateway/homelab --for=condition=Programmed --timeout=300s
       changed_when: false
 
     - name: Wait for Crossplane functions

@@ -52,7 +52,8 @@ kubeconfig: ## Write ~/.kube/<CLUSTER>.kubeconfig (CLUSTER=cluster-a)
 	@[ -n "$(CLUSTER)" ] || { echo "Usage: make kubeconfig CLUSTER=cluster-a"; exit 1; }
 	@umask 077; mkdir -p $(HOME)/.kube
 	@kubectl -n $(CLUSTER) get secret $(CLUSTER)-kubeconfig -o jsonpath='{.data.kubeconfig}' | base64 -d > $(HOME)/.kube/$(CLUSTER).kubeconfig
-	@echo "export KUBECONFIG=$(HOME)/.kube/$(CLUSTER).kubeconfig"
+	@/usr/local/bin/kubeconfig-merge
+	@echo "Wrote $(HOME)/.kube/$(CLUSTER).kubeconfig, merged into $(HOME)/.kube/config (context $(CLUSTER))"
 
 network-test: ## Check workload-cluster connectivity (allowed and blocked paths)
 	$(PLAY) $(PLAYBOOKS)/network-test.yml

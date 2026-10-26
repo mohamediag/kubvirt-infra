@@ -316,10 +316,75 @@
         mode: "0755"
         force: true
 
+    # One merged kubeconfig (kubectx does not support several files in
+    # KUBECONFIG): the management cluster (context "default") plus every
+    # workload cluster written to /root/.kube/<name>.kubeconfig by
+    # `make clusters` / `make kubeconfig`. Rebuilt by kubeconfig-merge, which
+    # keeps the current context.
+    - name: Kubeconfig merge script
+      ansible.builtin.copy:
+        dest: /usr/local/bin/kubeconfig-merge
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Managed by kubevirt-infra. Rebuilds {{ merged_kubeconfig }}.
+          set -eu
+          out={{ merged_kubeconfig }}
+          current=$(kubectl --kubeconfig "$out" config current-context 2>/dev/null || echo default)
+          files={{ kubeconfig }}
+          for f in /root/.kube/*.kubeconfig; do
+            [ -r "$f" ] && files="$files:$f"
+          done
+          umask 077
+          mkdir -p "$(dirname "$out")"
+          KUBECONFIG=$files kubectl config view --flatten > "$out.tmp"
+          kubectl --kubeconfig "$out.tmp" config use-context "$current" >/dev/null 2>&1 ||
+            kubectl --kubeconfig "$out.tmp" config use-context default >/dev/null
+          mv "$out.tmp" "$out"
+
+    # k3s rewrites its kubeconfig on restart and certificate rotation.
+    - name: Rebuild the merged kubeconfig when k3s rewrites its own
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/{{ item.name }}
+        content: "{{ item.content }}"
+      loop:
+        - name: kubeconfig-merge.service
+          content: |
+            [Unit]
+            Description=Merge kubeconfigs into {{ merged_kubeconfig }}
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/bin/kubeconfig-merge
+        - name: kubeconfig-merge.path
+          content: |
+            [Unit]
+            Description=Watch {{ kubeconfig }}
+
+            [Path]
+            PathChanged={{ kubeconfig }}
+
+            [Install]
+            WantedBy=multi-user.target
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Enable kubeconfig merge watcher
+      ansible.builtin.systemd_service:
+        name: kubeconfig-merge.path
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Build the merged kubeconfig
+      ansible.builtin.command: /usr/local/bin/kubeconfig-merge
+      when: kubeconfig is file
+      changed_when: false
+
     - name: Export KUBECONFIG for login shells
       ansible.builtin.copy:
         dest: /etc/profile.d/kubeconfig.sh
-        content: "export KUBECONFIG={{ kubeconfig }}\n"
+        content: "export KUBECONFIG={{ merged_kubeconfig }}\n"
 
     - name: SSH key used by the host to reach VMs
       community.crypto.openssh_keypair:

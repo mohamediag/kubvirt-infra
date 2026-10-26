@@ -1,4 +1,5 @@
-# Installs k3s (embedded etcd, no flannel/kube-proxy) and Cilium as its CNI.
+# Installs k3s (embedded etcd, no flannel/kube-proxy), the Gateway API CRDs and
+# Cilium as its CNI and Gateway API implementation.
 - name: Install k3s with Cilium
   hosts: all
   become: true
@@ -50,6 +51,12 @@
       until: readyz.rc == 0
       retries: 60
       delay: 5
+      changed_when: false
+
+    # Cilium enables its Gateway API controller only if the CRDs exist when
+    # the operator starts.
+    - name: Gateway API CRDs
+      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ repo_root }}/platform/gateway-api
       changed_when: false
 
     # helm is called directly: kubernetes.core.helm does not support Helm 4 yet.

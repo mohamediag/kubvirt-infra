@@ -4,6 +4,8 @@ k3s_version: v1.36.5+k3s1
 helm_version: v4.3.1
 cni_plugins_version: v1.9.1
 cilium_version: 1.20.4
+# Gateway API CRDs: the version Cilium is built against (its go.mod).
+gateway_api_version: v1.6.3
 multus_version: v4.3.1
 kubevirt_version: v1.9.1
 cdi_version: v1.66.1

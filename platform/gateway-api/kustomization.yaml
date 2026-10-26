@@ -1,0 +1,5 @@
+# Gateway API CRDs (standard channel), vendored by `make vendor`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - upstream/standard-install.yaml

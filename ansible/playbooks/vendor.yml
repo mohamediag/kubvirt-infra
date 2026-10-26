@@ -6,6 +6,8 @@
   vars:
     repo_root: "{{ playbook_dir }}/../.."
     manifests:
+      - url: https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/standard-install.yaml
+        dest: platform/gateway-api/upstream/standard-install.yaml
       - url: https://raw.githubusercontent.com/k8snetworkplumbingwg/multus-cni/{{ multus_version }}/deployments/multus-daemonset-thick.yml
         dest: platform/multus/upstream/multus-daemonset-thick.yaml
       - url: https://github.com/kubevirt/kubevirt/releases/download/{{ kubevirt_version }}/kubevirt-operator.yaml
