@@ -10,9 +10,10 @@ spec:
     vlanId: 110
     subnet: 192.168.110.0/24
     nodeIPStart: 10
-    loadBalancerRange: {start: 200, stop: 220}
+    asn: 65110
     podCIDR: 10.110.0.0/16
-    serviceCIDR: 10.111.0.0/16
+    loadBalancerCIDR: 10.250.110.0/24
+    serviceCIDR: 172.20.0.0/16
   cilium:
     clusterId: 1
   controlPlane:

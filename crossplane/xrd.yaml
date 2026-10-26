@@ -34,10 +34,6 @@ spec:
               type: object
               required: [network, cilium, sshAuthorizedKeys]
               x-kubernetes-validations:
-                - rule: >-
-                    self.network.nodeIPStart + self.controlPlane.replicas + self.workers.replicas - 1 < self.network.loadBalancerRange.start
-                    || self.network.nodeIPStart > self.network.loadBalancerRange.stop
-                  message: node IPs must not overlap network.loadBalancerRange
                 - rule: self.network.nodeIPStart + self.controlPlane.replicas + self.workers.replicas - 1 <= 254
                   message: node IPs must fit in network.subnet
               properties:
@@ -50,10 +46,11 @@ spec:
                   default: v1.36.5+k3s1
                 network:
                   type: object
-                  required: [vlanId, subnet, podCIDR, serviceCIDR]
-                  x-kubernetes-validations:
-                    - rule: self.loadBalancerRange.start <= self.loadBalancerRange.stop
-                      message: loadBalancerRange.start must be <= stop
+                  required: [vlanId, subnet, asn, podCIDR, loadBalancerCIDR]
+                  description: >-
+                    vlanId, subnet, asn, podCIDR and loadBalancerCIDR must match the
+                    cluster's entry in vm_vlans of ansible/group_vars/all/site.yml: the
+                    fabric only accepts those prefixes from that VLAN.
                   properties:
                     vlanId:
                       type: integer
@@ -77,20 +74,29 @@ spec:
                       description: Host part of the first node IP (control plane), workers follow.
                       x-kubernetes-validations:
                         - {rule: self == oldSelf, message: nodeIPStart is immutable}
-                    loadBalancerRange:
-                      type: object
-                      default: {start: 200, stop: 220}
-                      description: Host parts of the Cilium LoadBalancer IP pool in the subnet.
-                      properties:
-                        start: {type: integer, minimum: 2, maximum: 254, default: 200}
-                        stop: {type: integer, minimum: 2, maximum: 254, default: 220}
+                    asn:
+                      type: integer
+                      minimum: 1
+                      maximum: 4294967295
+                      description: The cluster's BGP AS; every node peers with the fabric (its default gateway).
+                      x-kubernetes-validations:
+                        - {rule: self == oldSelf, message: asn is immutable}
                     podCIDR:
                       type: string
+                      description: Routed natively (no overlay) and announced over BGP, one block per node.
                       x-kubernetes-validations:
                         - {rule: isCIDR(self), message: podCIDR must be a CIDR}
                         - {rule: self == oldSelf, message: podCIDR is immutable}
+                    loadBalancerCIDR:
+                      type: string
+                      description: Cilium LoadBalancer IP pool, outside the subnet; each IP is announced as a /32 by every node.
+                      x-kubernetes-validations:
+                        - {rule: isCIDR(self), message: loadBalancerCIDR must be a CIDR}
+                        - {rule: self == oldSelf, message: loadBalancerCIDR is immutable}
                     serviceCIDR:
                       type: string
+                      default: 172.20.0.0/16
+                      description: ClusterIPs never leave the cluster, so every cluster can use the same range.
                       x-kubernetes-validations:
                         - {rule: isCIDR(self), message: serviceCIDR must be a CIDR}
                         - {rule: self == oldSelf, message: serviceCIDR is immutable}

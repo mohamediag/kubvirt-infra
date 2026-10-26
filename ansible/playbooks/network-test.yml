@@ -1,6 +1,8 @@
-# Verifies workload-cluster networking from every cluster's control plane:
-# internet and other clusters (nodes + LoadBalancer IPs) reachable; the host and
-# the management cluster's networks blocked.
+# Verifies workload-cluster networking: every node has a BGP session with the
+# fabric; from every cluster's control plane, internet and other clusters
+# (nodes, pods, LoadBalancer IPs) reachable, the host and the management
+# cluster's networks blocked; pods reach other clusters' pods with their own
+# IP (no SNAT).
 - name: Workload cluster network test
   hosts: all
   become: true
@@ -24,6 +26,8 @@
       ansible.builtin.set_fact:
         clusters: "{{ clusters | default([]) + [{'name': xr.metadata.name, 'namespace': xr.metadata.namespace,
                        'cp': prefix ~ '.' ~ (xr.spec.network.nodeIPStart | default(10)),
+                       'nodes': 1 + (xr.spec.workers.replicas | default(2)),
+                       'subnet': xr.spec.network.subnet,
                        'gateway': prefix ~ '.1',
                        'kubeconfig': '/root/.kube/' ~ xr.metadata.name ~ '.kubeconfig'}] }}"
       vars:
@@ -42,14 +46,31 @@
         label: "{{ item.name }}"
       changed_when: false
 
+    - name: Every node has a BGP session with the fabric
+      ansible.builtin.shell: >-
+        vtysh -c 'show bgp ipv4 unicast summary json'
+        | jq --arg net '{{ item.subnet | regex_replace('0/24$', '') }}'
+        '[.peers | to_entries[] | select((.key | startswith($net)) and .value.state == "Established")] | length'
+      register: bgp_sessions
+      changed_when: false
+      failed_when: bgp_sessions.stdout | int != item.nodes | int
+      loop: "{{ clusters }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # agnhost netexec answers /clientip with the caller's address and /dial
+    # makes the pod itself call another address.
     - name: Deploy a test LoadBalancer service in each cluster
       ansible.builtin.shell: |
+        k="kubectl --kubeconfig {{ item.kubeconfig }} -n network-test"
         kubectl --kubeconfig {{ item.kubeconfig }} create namespace network-test --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
-        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test create deployment echo --image=nginx:1.27-alpine --port=80 --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
-        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test expose deployment echo --type=LoadBalancer --port=80 --dry-run=client -o yaml | kubectl --kubeconfig {{ item.kubeconfig }} apply -f -
-        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test rollout status deployment/echo --timeout=300s >/dev/null
-        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test wait svc/echo --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' --timeout=120s >/dev/null
-        kubectl --kubeconfig {{ item.kubeconfig }} -n network-test get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+        $k create deployment echo --image={{ echo_image }} --port=8080 --dry-run=client -o yaml -- /agnhost netexec --http-port=8080 | $k apply -f -
+        $k expose deployment echo --type=LoadBalancer --port=80 --target-port=8080 --dry-run=client -o yaml | $k apply -f -
+        $k rollout status deployment/echo --timeout=300s >/dev/null
+        $k wait svc/echo --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' --timeout=120s >/dev/null
+        echo "$($k get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}') $($k get pod -l app=echo -o jsonpath='{.items[0].status.podIP}')"
+      vars:
+        echo_image: registry.k8s.io/e2e-test-images/agnhost:2.53
       loop: "{{ clusters }}"
       loop_control:
         label: "{{ item.name }}"
@@ -58,7 +79,9 @@
 
     - name: Record LoadBalancer IPs
       ansible.builtin.set_fact:
-        with_lb: "{{ with_lb | default([]) + [item.0 | combine({'lb': item.1.stdout_lines | last})] }}"
+        with_lb: "{{ with_lb | default([]) + [item.0 | combine({'lb': ips[0], 'pod': ips[1]})] }}"
+      vars:
+        ips: "{{ (item.1.stdout_lines | last).split() }}"
       loop: "{{ clusters | zip(lb.results) | list }}"
       loop_control:
         label: "{{ item.0.name }}"
@@ -79,6 +102,20 @@
         label: "{{ item.name }}"
       register: checks
       changed_when: false
+
+    # From the host (it reaches pods through the BGP routes): ask each echo
+    # pod to call the other clusters' echo pods, which report the source IP.
+    - name: Pods reach other clusters' pods without SNAT
+      ansible.builtin.shell: >-
+        curl -fsS -m 10 'http://{{ item.0.pod }}:8080/dial?request=clientip&protocol=http&host={{ item.1.pod }}&port=8080&tries=1'
+        | jq -r '.responses[0] // .errors[0]' | cut -d: -f1
+      loop: "{{ clusters | product(clusters) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} pod {{ item.0.pod }} -> {{ item.1.name }} pod {{ item.1.pod }}"
+      when: item.0.name != item.1.name
+      register: no_snat
+      changed_when: false
+      failed_when: no_snat.stdout != item.0.pod
 
     - name: Results
       ansible.builtin.debug:

@@ -2,7 +2,9 @@
 
 Code for a single-node **management cluster** that runs virtual machines with
 KubeVirt and provisions **workload Kubernetes clusters** (k3s + Cilium) on those
-VMs through a Crossplane API, one VLAN per cluster.
+VMs through a Crossplane API, one VLAN per cluster. Workload clusters route
+pods natively (no overlay) and announce pod CIDRs and LoadBalancer IPs over
+BGP to the host, which plays the fabric.
 
 ```
                        Hetzner host (Ubuntu 26.04, enp5s0)
@@ -12,10 +14,13 @@ VMs through a Crossplane API, one VLAN per cluster.
 │   ├─ Multus, KubeVirt + CDI ─ golden image vm-images/ubuntu-2404             │
 │   └─ Crossplane 2 ─ KubernetesCluster API (crossplane/)                      │
 │                                                                              │
+│  FRR (AS 65000) ─ eBGP with every workload node, routes pods + LB IPs         │
 │  br-vms (VLAN-aware bridge)                         NAT ──► internet         │
 │   ├─ untagged   192.168.100.0/24  gw br-vms      test-vm                     │
 │   ├─ VLAN 110   192.168.110.0/24  gw br-vms.110  cluster-a: cp .10, wk .11-.12│
+│   │             AS 65110, pods 10.110.0.0/16, LB 10.250.110.0/24             │
 │   └─ VLAN 120   192.168.120.0/24  gw br-vms.120  cluster-b: cp .10, wk .11-.12│
+│                 AS 65120, pods 10.120.0.0/16, LB 10.250.120.0/24             │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -38,7 +43,7 @@ target converges the host back to the code.
 
 | Target | What it does |
 |---|---|
-| `host` | Package upgrades, sysctls, CNI plugins, VM bridge `br-vms`, NAT (`vm-nat.service`), UFW rules, helm/virtctl, host SSH key for VMs |
+| `host` | Package upgrades, sysctls, CNI plugins, VM bridge `br-vms`, NAT (`vm-nat.service`), BGP fabric (FRR), UFW rules, helm/virtctl, host SSH key for VMs |
 | `k3s` | k3s with `ansible/templates/k3s-config.yaml.j2` (no flannel, kube-proxy, traefik, servicelb), Gateway API CRDs and Cilium |
 | `platform` | Multus, KubeVirt, CDI, VM network, golden image, Crossplane + functions + RBAC, Gateway |
 | `vendor` | Re-download pinned upstream manifests into `platform/*/upstream` |
@@ -46,7 +51,7 @@ target converges the host back to the code.
 | `crossplane-api` | Apply the `KubernetesCluster` XRD + Composition only |
 | `clusters` | Check clusters against `site.yml`, apply API + clusters (SSH keys injected), wait Ready |
 | `kubeconfig CLUSTER=…` | Write `~/.kube/<cluster>.kubeconfig` |
-| `network-test` | From each control plane: internet + other clusters reachable, host/management blocked |
+| `network-test` | BGP sessions up; from each control plane: internet + other clusters (nodes, pods, LB IPs) reachable, host/management blocked; pod-to-pod across clusters without SNAT |
 | `clusters-delete` | **Destructive.** Delete all workload clusters and their disks (`CONFIRM=yes`) |
 | `k3s-uninstall` | **Destructive.** Removes k3s and every VM (`CONFIRM=yes`) |
 
@@ -57,7 +62,7 @@ ansible/
   group_vars/all/versions.yml   pinned versions (single place to upgrade)
   group_vars/all/site.yml       host IP/interface, CIDRs, VM network, admin IPs
   playbooks/                    host, k3s, platform, vendor, test-vm, clusters, network-test
-  templates/                    k3s config, cloud-init user/network data, network check
+  templates/                    k3s config, FRR config, cloud-init user/network data, network check
 platform/
   cilium/values.yaml            Helm values
   gateway-api/                  vendored Gateway API CRDs (standard channel)
@@ -86,9 +91,10 @@ spec:
   network:
     vlanId: 110
     subnet: 192.168.110.0/24        # host is .1; nodes from nodeIPStart (10)
-    loadBalancerRange: {start: 200, stop: 220}
-    podCIDR: 10.110.0.0/16
-    serviceCIDR: 10.111.0.0/16
+    asn: 65110                      # BGP AS of the cluster's nodes
+    podCIDR: 10.110.0.0/16          # routed, announced per node
+    loadBalancerCIDR: 10.250.110.0/24  # routed, announced as /32s
+    serviceCIDR: 172.20.0.0/16      # default; never leaves the cluster
   cilium: {clusterId: 1}            # unique per cluster (Cluster Mesh-ready)
   controlPlane: {replicas: 1, cpu: 2, memory: 4Gi, diskSize: 20Gi}
   workers: {replicas: 2, cpu: 4, memory: 8Gi, diskSize: 40Gi}
@@ -112,15 +118,21 @@ the cluster's namespace:
   `<name>-kubeconfig`. The XR is Ready once that Job completes.
 
 Inside the VMs, k3s runs without flannel/kube-proxy/traefik/servicelb. k3s's
-helm-controller installs Cilium at boot (kube-proxy replacement, Hubble, LB IPAM
-with L2 announcements from `loadBalancerRange`).
+helm-controller installs Cilium at boot: kube-proxy replacement with Maglev,
+native routing, BGP control plane, LB IPAM from `loadBalancerCIDR`, Hubble.
+The fabric's AS and routed range come from the EnvironmentConfig `fabric`,
+written by `make clusters` from `site.yml` (`fabric_asn`, `fabric_routed_cidr`)
+and read by function-environment-configs.
 
-Validation (CEL in `crossplane/xrd.yaml`): /24 subnet, node IPs and LB range in
-the subnet and not overlapping, `vlanId`/`subnet`/CIDRs/`clusterId` immutable.
-Scaling `workers.replicas` (0-8) is supported.
+Validation (CEL in `crossplane/xrd.yaml`): /24 subnet, node IPs in the subnet,
+CIDRs valid, `vlanId`/`subnet`/`asn`/CIDRs/`clusterId` immutable. `make clusters`
+checks each cluster against its `vm_vlans` entry and that VLANs and cluster
+IDs are unique; `make host` checks that no two ranges overlap. Scaling
+`workers.replicas` (0-8) is supported.
 
-**Adding a cluster:** add its VLAN to `vm_vlans` in `site.yml`, `make host`,
-add `clusters/<name>/{namespace,cluster}.yaml`, `make clusters`.
+**Adding a cluster:** add its entry to `vm_vlans` in `site.yml` (VLAN, subnet,
+ASN, pod and LB CIDRs), `make host`, add `clusters/<name>/{namespace,cluster}.yaml`
+with the same values, `make clusters`.
 
 ## Exposing apps (Gateway API)
 
@@ -160,15 +172,45 @@ Ubuntu image build (`platform/images/ubuntu-2404.yaml`).
   access ports of its VLAN; the host has a gateway interface `br-vms.<id>` on
   `.1` per VLAN (`vm_vlans` in `site.yml`). The untagged network (PVID 1,
   `192.168.100.0/24`) is used by the test VM.
-* **Firewall (UFW):** inbound to the host only from `admin_sources`.
+* **BGP fabric:** FRR on the host (AS `fabric_asn`, `ansible/templates/frr.conf.j2`)
+  has one passive peer group per cluster (`bgp listen range` = the VLAN
+  subnet, `remote-as` = the cluster's ASN). Every node opens a session to its
+  default gateway (Cilium `autoDiscovery: DefaultGateway`) and announces its pod
+  block plus every LoadBalancer IP as a /32 (`externalTrafficPolicy: Cluster`,
+  so all nodes do; the host spreads flows over them with ECMP, 5-tuple hash).
+  Inbound filter: only the cluster's `pod_cidr` and `lb_cidr` from `site.yml`,
+  max 512 prefixes per node; the host announces nothing (nodes use their
+  default route). `vtysh -c 'show bgp summary'`, `ip route show proto bgp`.
+* **Failover** (measured with a client opening ~10 connections/s to an LB IP):
+
+  | Event | Routes | Effect |
+  |---|---|---|
+  | node dies or hangs | withdrawn when the 9s hold timer expires (keepalive 3s; Cilium OSS has no BFD) | new connections hashed to that node fail for ~8s |
+  | Cilium agent restart (upgrade, config change) | kept by graceful restart (120s; the agent took 30-56s) | none |
+  | planned maintenance: `kubectl label node <n> bgp.kubvirt-infra.io/drain=true` | withdrawn at once | none; remove the label afterwards |
+
+  FRR ignores graceful restart when the hold timer expires
+  (`no bgp graceful-restart notification`), otherwise a dead node would keep
+  its routes for 9s + 120s. A node shut down without draining closes its
+  sessions cleanly and keeps its routes for up to 120s. Existing connections
+  to a node that leaves the ECMP set are reset (flows are rehashed).
+* **Native routing:** no VXLAN. Nodes of a cluster route pod blocks to each
+  other on their VLAN (`autoDirectNodeRoutes`); other clusters are reached
+  through the host. Pods keep their IP towards `fabric_routed_cidr`
+  (`10.0.0.0/8`: all clusters' pods and LB IPs) and are masqueraded to the node
+  IP otherwise (internet, node IPs), then to the host IP by `vm-nat`.
+* **Anti-spoofing:** strict reverse-path filtering on each `br-vms.<id>`: a
+  VLAN can only send from its subnet and the prefixes its nodes announced.
+* **Firewall (UFW):** inbound to the host only from `admin_sources`, plus BGP
+  (179/tcp) from each VLAN to its gateway.
 
   | From | To | |
   |---|---|---|
   | VMs | internet | allowed, NAT via `enp5s0` |
-  | VMs | VMs in the same VLAN | allowed (bridged) |
-  | cluster VLAN | other cluster VLANs | allowed, routed without NAT |
+  | VMs, pods | same cluster | allowed (bridged) |
+  | cluster | other clusters: nodes, pods, LB IPs | allowed, routed without NAT |
   | VMs | host services, management pods/services | **blocked** (explicit deny first) |
-  | management pods | VMs | allowed |
+  | management pods | VMs, workload pods, LB IPs | allowed |
 * The host reaches VMs directly: `ssh -i /root/.ssh/vm_ed25519 ubuntu@<vm-ip>`.
   From a workstation: `ssh -J root@<host> ubuntu@<vm-ip>`.
 

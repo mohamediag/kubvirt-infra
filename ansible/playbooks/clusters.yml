@@ -59,23 +59,55 @@
         - name: Stop here when deleting
           ansible.builtin.meta: end_play
 
-    - name: Each cluster's VLAN must exist on the host (site.yml vm_vlans)
+    # site.yml is the fabric's policy (FRR filters, firewall); host.yml
+    # checks that its ranges are unique.
+    - name: Each cluster must match its VLAN on the host (site.yml vm_vlans)
       ansible.builtin.assert:
         that:
           - vlan | length == 1
-          - vlan[0].cidr == item.xr.spec.network.subnet
+          - vlan[0].cidr == net.subnet
+          - vlan[0].asn == net.asn
+          - vlan[0].pod_cidr == net.podCIDR
+          - vlan[0].lb_cidr == net.loadBalancerCIDR
         fail_msg: >-
-          {{ item.xr.metadata.name }}: VLAN {{ item.xr.spec.network.vlanId }} / {{ item.xr.spec.network.subnet }}
-          is not in vm_vlans. Add it to ansible/group_vars/all/site.yml and run `make host`.
+          {{ item.xr.metadata.name }}: VLAN {{ net.vlanId }} (subnet {{ net.subnet }}, asn {{ net.asn }},
+          podCIDR {{ net.podCIDR }}, loadBalancerCIDR {{ net.loadBalancerCIDR }}) does not match vm_vlans.
+          Fix ansible/group_vars/all/site.yml and run `make host`, or fix the cluster.
         quiet: true
       vars:
+        net: "{{ item.xr.spec.network }}"
         vlan: "{{ vm_vlans | selectattr('id', 'equalto', item.xr.spec.network.vlanId) | list }}"
       loop: "{{ clusters }}"
       loop_control:
         label: "{{ item.xr.metadata.name }}"
 
+    - name: VLANs and Cilium cluster IDs must be unique across clusters
+      ansible.builtin.assert:
+        that:
+          - vlans | unique | length == vlans | length
+          - ids | unique | length == ids | length
+        fail_msg: "Duplicate vlanId {{ vlans }} or cilium.clusterId {{ ids }} in clusters/*/cluster.yaml"
+        quiet: true
+      vars:
+        vlans: "{{ clusters | map(attribute='xr.spec.network.vlanId') | list }}"
+        ids: "{{ clusters | map(attribute='xr.spec.cilium.clusterId') | list }}"
+
     - name: KubernetesCluster API
       ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ repo_root }}/crossplane
+      changed_when: false
+
+    - name: Fabric settings for the composition (EnvironmentConfig "fabric")
+      ansible.builtin.command:
+        cmd: kubectl apply --server-side -f -
+        stdin: "{{ fabric | to_json }}"
+      vars:
+        fabric:
+          apiVersion: apiextensions.crossplane.io/v1beta1
+          kind: EnvironmentConfig
+          metadata: {name: fabric}
+          data:
+            asn: "{{ fabric_asn | int }}"
+            routedCIDRs: ["{{ fabric_routed_cidr }}"]
       changed_when: false
 
     - name: Wait for the API to be established

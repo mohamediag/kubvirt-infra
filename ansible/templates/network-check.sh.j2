@@ -1,5 +1,7 @@
 #!/bin/sh
 # Runs on {{ src.name }}'s control plane. Prints PASS/FAIL per expectation.
+# Other clusters' pods and LoadBalancer IPs are reached through the fabric's
+# BGP routes.
 check() {
   want=$1; desc=$2; shift 2
   if "$@" >/dev/null 2>&1; then got=reachable; else got=blocked; fi
@@ -9,6 +11,7 @@ check reachable "internet (https://cloud-images.ubuntu.com)" curl -fsS -m 10 -o 
 {% for peer in peers %}
 check reachable "{{ peer.name }} node {{ peer.cp }}:6443" nc -z -w 3 {{ peer.cp }} 6443
 check reachable "{{ peer.name }} LoadBalancer http://{{ peer.lb }}" curl -fsS -m 5 -o /dev/null http://{{ peer.lb }}
+check reachable "{{ peer.name }} pod http://{{ peer.pod }}:8080" curl -fsS -m 5 -o /dev/null http://{{ peer.pod }}:8080/hostname
 {% endfor %}
 check blocked "host {{ node_ip }}:22" nc -z -w 3 {{ node_ip }} 22
 check blocked "host gateway {{ src.gateway }}:22" nc -z -w 3 {{ src.gateway }} 22

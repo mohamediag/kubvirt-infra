@@ -1,5 +1,7 @@
 # Renders a KubernetesCluster into KubeVirt VMs that bootstrap k3s + Cilium
-# with cloud-init. Everything is created in the XR's namespace.
+# with cloud-init. Everything is created in the XR's namespace. Cilium routes
+# pods natively and announces pod CIDRs and LoadBalancer IPs over BGP to the
+# fabric described by EnvironmentConfig "fabric".
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
@@ -10,6 +12,17 @@ spec:
     kind: KubernetesCluster
   mode: Pipeline
   pipeline:
+    - step: fabric
+      functionRef:
+        name: function-environment-configs
+      input:
+        apiVersion: environmentconfigs.fn.crossplane.io/v1beta1
+        kind: Input
+        spec:
+          environmentConfigs:
+            - type: Reference
+              ref:
+                name: fabric
     - step: render
       functionRef:
         name: function-go-templating
@@ -31,6 +44,7 @@ spec:
             {{- $cpIP := printf "%s.%d" $prefix $start }}
             {{- $gateway := printf "%s.1" $prefix }}
             {{- $secretName := printf "%s-kubeconfig" $name }}
+            {{- $fabric := index .context "apiextensions.crossplane.io/environment" }}
 
             {{- /* Join token: generated once, then read back from the observed Secret. */}}
             {{- $token := randAlphaNum 48 }}
@@ -156,8 +170,28 @@ spec:
                           operator:
                             replicas: 1
                           devices: [eth0]
-                          l2announcements:
+                          # No overlay: nodes of the cluster route pod blocks to
+                          # each other on the VLAN, everything else goes to the
+                          # fabric, which learns the pod blocks over BGP.
+                          routingMode: native
+                          ipv4NativeRoutingCIDR: {{ $net.podCIDR }}
+                          autoDirectNodeRoutes: true
+                          bpf:
+                            masquerade: true
+                          # Pods keep their IP towards the routed range (other
+                          # clusters' pods and LoadBalancer IPs); the rest is
+                          # masqueraded to the node IP.
+                          ipMasqAgent:
                             enabled: true
+                            config:
+                              nonMasqueradeCIDRs: {{ $fabric.routedCIDRs | toJson }}
+                              masqLinkLocal: false
+                          bgpControlPlane:
+                            enabled: true
+                          # Consistent backend selection on every node, so ECMP
+                          # from the fabric may land anywhere.
+                          loadBalancer:
+                            algorithm: maglev
                           externalIPs:
                             enabled: true
                           k8sClientRateLimit:
@@ -166,31 +200,87 @@ spec:
                           hubble:
                             relay:
                               enabled: true
-                  - path: /etc/kubvirt-infra/cilium-lb.yaml
+                  # Every node peers with its default gateway (the fabric) and
+                  # announces its pod block and all LoadBalancer IPs.
+                  - path: /etc/kubvirt-infra/cilium-bgp.yaml
                     content: |
                       apiVersion: cilium.io/v2
                       kind: CiliumLoadBalancerIPPool
                       metadata:
-                        name: vlan
+                        name: fabric
                       spec:
+                        # .0 and .255 confuse some clients.
+                        allowFirstLastIPs: "No"
                         blocks:
-                          - start: {{ $prefix }}.{{ int $net.loadBalancerRange.start }}
-                            stop: {{ $prefix }}.{{ int $net.loadBalancerRange.stop }}
+                          - cidr: {{ $net.loadBalancerCIDR }}
                       ---
-                      apiVersion: cilium.io/v2alpha1
-                      kind: CiliumL2AnnouncementPolicy
+                      apiVersion: cilium.io/v2
+                      kind: CiliumBGPClusterConfig
                       metadata:
-                        name: vlan
+                        name: fabric
                       spec:
-                        interfaces: [eth0]
-                        loadBalancerIPs: true
-                        externalIPs: true
+                        # Label a node bgp.kubvirt-infra.io/drain before
+                        # maintenance: its routes are withdrawn at once instead
+                        # of being kept for the graceful-restart time.
+                        nodeSelector:
+                          matchExpressions:
+                            - {key: bgp.kubvirt-infra.io/drain, operator: DoesNotExist}
+                        bgpInstances:
+                          - name: fabric
+                            localASN: {{ int64 $net.asn }}
+                            peers:
+                              - name: gateway
+                                peerASN: {{ int64 $fabric.asn }}
+                                autoDiscovery:
+                                  mode: DefaultGateway
+                                  defaultGateway: {addressFamily: ipv4}
+                                peerConfigRef: {name: fabric}
+                      ---
+                      apiVersion: cilium.io/v2
+                      kind: CiliumBGPPeerConfig
+                      metadata:
+                        name: fabric
+                      spec:
+                        # A dead node is withdrawn after the hold time (no BFD in
+                        # Cilium OSS; the fabric ignores graceful restart then).
+                        timers:
+                          connectRetryTimeSeconds: 5
+                          holdTimeSeconds: 9
+                          keepAliveTimeSeconds: 3
+                        # The fabric keeps the routes while the agent restarts
+                        # (measured 30-56s). A node that shuts down also closes
+                        # the session cleanly: drain it first (above).
+                        gracefulRestart:
+                          enabled: true
+                          restartTimeSeconds: 120
+                        families:
+                          - afi: ipv4
+                            safi: unicast
+                            advertisements:
+                              matchLabels: {advertise: fabric}
+                      ---
+                      apiVersion: cilium.io/v2
+                      kind: CiliumBGPAdvertisement
+                      metadata:
+                        name: fabric
+                        labels: {advertise: fabric}
+                      spec:
+                        advertisements:
+                          - advertisementType: PodCIDR
+                          # All LoadBalancer services, unless labelled
+                          # bgp.kubvirt-infra.io/skip.
+                          - advertisementType: Service
+                            service:
+                              addresses: [LoadBalancerIP]
+                            selector:
+                              matchExpressions:
+                                - {key: bgp.kubvirt-infra.io/skip, operator: DoesNotExist}
                   {{- end }}
                 runcmd:
                   - systemctl enable --now qemu-guest-agent
                   - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ $spec.k3sVersion }} sh -s - {{ $node.role }}
                   {{- if eq $node.role "server" }}
-                  - until k3s kubectl get crd ciliumloadbalancerippools.cilium.io ciliuml2announcementpolicies.cilium.io >/dev/null 2>&1; do sleep 5; done; k3s kubectl apply -f /etc/kubvirt-infra/cilium-lb.yaml
+                  - until k3s kubectl get crd ciliumloadbalancerippools.cilium.io ciliumbgpclusterconfigs.cilium.io ciliumbgppeerconfigs.cilium.io ciliumbgpadvertisements.cilium.io >/dev/null 2>&1; do sleep 5; done; k3s kubectl apply -f /etc/kubvirt-infra/cilium-bgp.yaml
                   {{- end }}
             ---
             apiVersion: kubevirt.io/v1

@@ -1,5 +1,5 @@
 # Prepares the management host: packages, kernel settings, VM bridge + NAT,
-# firewall and CLI tools.
+# BGP fabric (FRR), firewall and CLI tools.
 - name: Prepare management host
   hosts: all
   become: true
@@ -12,7 +12,7 @@
 
     - name: Install packages
       ansible.builtin.apt:
-        name: [curl, jq, nftables, ufw]
+        name: [curl, jq, nftables, ufw, frr]
 
     - name: Check whether a reboot is required
       ansible.builtin.stat:
@@ -33,6 +33,8 @@
       vars:
         settings:
           net.ipv4.ip_forward: 1
+          # ECMP over workload nodes: hash on the 5-tuple, not only the IPs.
+          net.ipv4.fib_multipath_hash_policy: 1
           fs.inotify.max_user_instances: 1024
           fs.inotify.max_user_watches: 1048576
 
@@ -43,6 +45,60 @@
       ansible.builtin.set_fact:
         vm_networks: "{{ vm_networks | default([{'iface': vm_bridge, 'cidr': vm_net_cidr}]) + [{'iface': vm_bridge ~ '.' ~ item.id, 'cidr': item.cidr}] }}"
       loop: "{{ vm_vlans }}"
+
+    - name: Routed address ranges
+      ansible.builtin.set_fact:
+        fabric_ranges: >-
+          {{ [pod_cidr, service_cidr, vm_net_cidr]
+             + vm_vlans | map(attribute='cidr') | list
+             + vm_vlans | map(attribute='pod_cidr') | list
+             + vm_vlans | map(attribute='lb_cidr') | list }}
+
+    - name: VLANs, ASNs and address ranges must be unique (site.yml)
+      ansible.builtin.assert:
+        that:
+          - vm_vlans | map(attribute='id') | unique | length == vm_vlans | length
+          - (vm_vlans | map(attribute='asn') | unique | list + [fabric_asn]) | unique | length == vm_vlans | length + 1
+          - overlaps == ''
+          - outside == ''
+        fail_msg: >-
+          Duplicate VLAN ID or ASN, or overlapping ranges [{{ overlaps }}], or pod/LB
+          ranges outside fabric_routed_cidr [{{ outside }}].
+        quiet: true
+      vars:
+        overlaps: >-
+          {%- set out = [] -%}
+          {%- for a in fabric_ranges -%}{%- for b in fabric_ranges[loop.index:] -%}
+          {%- if a | ansible.utils.network_in_network(b) or b | ansible.utils.network_in_network(a) -%}
+          {%- set _ = out.append(a ~ ' / ' ~ b) -%}
+          {%- endif -%}{%- endfor -%}{%- endfor -%}
+          {{ out | join(', ') }}
+        outside: >-
+          {%- set out = [] -%}
+          {%- for r in vm_vlans | map(attribute='pod_cidr') | list + vm_vlans | map(attribute='lb_cidr') | list -%}
+          {%- if not fabric_routed_cidr | ansible.utils.network_in_network(r) -%}{%- set _ = out.append(r) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out | join(', ') }}
+
+    # FRR installs the BGP routes; networkd must not remove them (nor
+    # Cilium's) when it reconfigures links.
+    - name: networkd drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/networkd.conf.d
+        state: directory
+        mode: "0755"
+
+    - name: networkd leaves foreign routes alone
+      ansible.builtin.copy:
+        dest: /etc/systemd/networkd.conf.d/50-kubevirt-infra.conf
+        content: |
+          [Network]
+          ManageForeignRoutes=no
+          ManageForeignNextHops=no
+      notify: Restart networkd
+
+    - name: Apply networkd settings before FRR installs routes
+      ansible.builtin.meta: flush_handlers
 
     - name: VM bridge netdev
       ansible.builtin.copy:
@@ -116,6 +172,9 @@
           Address={{ item.cidr | ansible.utils.ipaddr('1') }}
           ConfigureWithoutCarrier=yes
           IgnoreCarrierLoss=yes
+          # Only sources routed through this VLAN (its nodes, and the pod and
+          # LB prefixes its nodes announce): no spoofing of other tenants.
+          IPv4ReversePathFilter=strict
       loop: "{{ vm_vlans }}"
       notify: Reload networkd
 
@@ -252,15 +311,45 @@
         comment: kubevirt-infra VM egress
       loop: "{{ vm_networks }}"
 
-    - name: VMs in different VLANs may reach each other
+    # Same-cluster pod traffic between nodes is bridged (autoDirectNodeRoutes).
+    - name: Pods of a cluster may reach each other
       community.general.ufw:
         rule: allow
         route: true
-        from_ip: "{{ item.0 }}"
-        to_ip: "{{ item.1 }}"
-        comment: kubevirt-infra inter-VLAN
-      loop: "{{ vm_vlans | map(attribute='cidr') | product(vm_vlans | map(attribute='cidr')) | list }}"
-      when: item.0 != item.1
+        interface_in: "{{ vm_bridge }}"
+        interface_out: "{{ vm_bridge }}"
+        from_ip: "{{ item.pod_cidr }}"
+        comment: kubevirt-infra same-cluster pods
+      loop: "{{ vm_vlans }}"
+
+    # Between clusters: everything routed from one VLAN interface to another,
+    # i.e. node IPs, pod IPs and LoadBalancer IPs, without NAT. Strict
+    # rp_filter on br-vms.<id> limits sources to the VLAN's own prefixes.
+    - name: Clusters may reach each other
+      community.general.ufw:
+        rule: allow
+        route: true
+        interface_in: "{{ vm_bridge }}.{{ item.0.id }}"
+        interface_out: "{{ vm_bridge }}.{{ item.1.id }}"
+        comment: kubevirt-infra inter-cluster
+      loop: "{{ vm_vlans | product(vm_vlans) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} -> {{ item.1.name }}"
+      when: item.0.id != item.1.id
+
+    - name: Workload nodes may open BGP sessions to their gateway
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ vm_bridge }}.{{ item.id }}"
+        proto: tcp
+        from_ip: "{{ item.cidr }}"
+        to_ip: "{{ item.cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}"
+        to_port: "179"
+        comment: kubevirt-infra BGP
+      loop: "{{ vm_vlans }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Pods may reach VMs
       community.general.ufw:
@@ -271,9 +360,45 @@
         comment: kubevirt-infra pods to VMs
       loop: "{{ vm_networks }}"
 
+    - name: Pods may reach workload pods and LoadBalancer IPs
+      community.general.ufw:
+        rule: allow
+        route: true
+        from_ip: "{{ pod_cidr }}"
+        to_ip: "{{ item }}"
+        comment: kubevirt-infra pods to VMs
+      loop: "{{ vm_vlans | map(attribute='pod_cidr') | list + vm_vlans | map(attribute='lb_cidr') | list }}"
+
     - name: Enable firewall
       community.general.ufw:
         state: enabled
+
+    # --- BGP fabric (FRR) ------------------------------------------------
+    # Passive eBGP: every workload node connects to its VLAN gateway
+    # (Cilium autoDiscovery DefaultGateway). The host accepts only the
+    # cluster's pod CIDR and LoadBalancer /32s and announces nothing.
+    - name: Enable bgpd
+      ansible.builtin.lineinfile:
+        path: /etc/frr/daemons
+        regexp: ^bgpd=
+        line: bgpd=yes
+      notify: Restart frr
+
+    - name: FRR configuration
+      ansible.builtin.template:
+        src: ../templates/frr.conf.j2
+        dest: /etc/frr/frr.conf
+        owner: frr
+        group: frr
+        mode: "0640"
+        validate: /usr/bin/vtysh --dryrun --inputfile %s
+      notify: Reload frr
+
+    - name: Enable FRR
+      ansible.builtin.systemd_service:
+        name: frr
+        enabled: true
+        state: started
 
     # --- Tools -----------------------------------------------------------
     - name: Check installed helm version
@@ -393,6 +518,24 @@
         comment: kubevirt-infra@{{ inventory_hostname }}
 
   handlers:
+    - name: Restart networkd
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        state: restarted
+
+    - name: Restart frr
+      ansible.builtin.systemd_service:
+        name: frr
+        state: restarted
+      register: frr_restart
+
+    # A restart already loaded the new configuration.
+    - name: Reload frr
+      ansible.builtin.systemd_service:
+        name: frr
+        state: reloaded
+      when: frr_restart is not defined or frr_restart is skipped
+
     - name: Reload networkd
       ansible.builtin.shell: networkctl reload && networkctl reconfigure {{ vm_bridge }}
       changed_when: true

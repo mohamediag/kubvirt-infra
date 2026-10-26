@@ -17,12 +17,22 @@ vm_net_gateway: 192.168.100.1
 vm_net_prefix: 24
 vm_dns: [1.1.1.1, 9.9.9.9]
 
-# One VLAN per workload cluster. The host owns .1 of each subnet as gateway.
-# Must match spec.network of the cluster in clusters/<name>/cluster.yaml
-# (checked by `make clusters`).
+# One VLAN per workload cluster. The host owns .1 of each subnet as gateway
+# and BGP peer. Each cluster's nodes announce its pod CIDR and LoadBalancer
+# IPs from AS `asn`; the host (FRR) accepts nothing else from that VLAN, so
+# these entries are the fabric's policy, not the tenant's. Must match
+# spec.network of clusters/<name>/cluster.yaml (checked by `make clusters`);
+# no two ranges may overlap (checked by `make host`).
 vm_vlans:
-  - {id: 110, name: cluster-a, cidr: 192.168.110.0/24}
-  - {id: 120, name: cluster-b, cidr: 192.168.120.0/24}
+  - {id: 110, name: cluster-a, cidr: 192.168.110.0/24, asn: 65110, pod_cidr: 10.110.0.0/16, lb_cidr: 10.250.110.0/24}
+  - {id: 120, name: cluster-b, cidr: 192.168.120.0/24, asn: 65120, pod_cidr: 10.120.0.0/16, lb_cidr: 10.250.120.0/24}
+
+# The fabric: FRR on the host, one eBGP session per workload node.
+fabric_asn: 65000
+# Traffic from workload pods to this range keeps the pod IP (no SNAT): pods
+# and LoadBalancer IPs of all clusters are routed. Everything else (internet,
+# node IPs) is masqueraded to the node IP.
+fabric_routed_cidr: 10.0.0.0/8
 
 # Keys injected into VMs: a host-generated key (lets the management host reach
 # the VMs) plus the operator keys already authorized on the host.
