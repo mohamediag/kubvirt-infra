@@ -24,6 +24,142 @@ BGP to the host, which plays the fabric.
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Architecture
+
+### Topology
+
+The host owns the network: one VLAN per workload cluster on `br-vms`, a
+gateway per VLAN, FRR peering with every workload node, UFW and NAT. The
+management cluster runs the VMs (KubeVirt) and the `KubernetesCluster` API
+(Crossplane); workload clusters only see their own VLAN.
+
+```mermaid
+flowchart TB
+    internet(("Internet"))
+    admin(["Admin workstation"])
+
+    subgraph host["Hetzner host · Ubuntu 26.04"]
+        direction TB
+        nic["enp5s0 · public IP"]
+        fw["UFW + NAT (vm-nat)"]
+        frr["FRR · AS 65000<br/>passive eBGP per VLAN"]
+
+        subgraph mgmt["Management cluster · k3s + Cilium"]
+            direction LR
+            gw["Gateway API<br/>homelab :80"]
+            xp["Crossplane 2<br/>KubernetesCluster API"]
+            kv["KubeVirt + CDI + Multus"]
+            img[("Golden image<br/>ubuntu-2404")]
+        end
+
+        subgraph bridge["br-vms · VLAN-aware bridge"]
+            direction LR
+            g100["br-vms<br/>192.168.100.1"]
+            g110["br-vms.110<br/>192.168.110.1"]
+            g120["br-vms.120<br/>192.168.120.1"]
+        end
+    end
+
+    subgraph ca["cluster-a · VLAN 110 · AS 65110"]
+        direction LR
+        a0["cp-0 .10"]
+        a1["worker-0 .11"]
+        a2["worker-1 .12"]
+    end
+
+    subgraph cb["cluster-b · VLAN 120 · AS 65120"]
+        direction LR
+        b0["cp-0 .10"]
+        b1["worker-0 .11"]
+        b2["worker-1 .12"]
+    end
+
+    testvm["test-vm<br/>untagged"]
+
+    internet <--> nic
+    admin -- "SSH, HTTP (admin_sources)" --> nic
+    nic --- fw
+    fw --- gw
+    xp -- "renders VMs, cloud-init, NAD" --> kv
+    img -. "cloned per node" .-> kv
+    kv -- "one NIC per VM" --> bridge
+    g100 --- testvm
+    g110 --- ca
+    g120 --- cb
+    ca -- "eBGP: pod /24s, LB /32s" --> frr
+    cb -- "eBGP: pod /24s, LB /32s" --> frr
+```
+
+### Provisioning a cluster
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor op as Operator
+    participant mk as make clusters
+    participant api as Management API
+    participant xp as Crossplane pipeline
+    participant kv as KubeVirt
+    participant cp as cluster-a cp-0
+    participant wk as cluster-a workers
+    participant frr as FRR (host)
+
+    op->>mk: make clusters
+    mk->>mk: check clusters against site.yml
+    mk->>api: apply EnvironmentConfig fabric, XRD, Composition
+    mk->>api: apply KubernetesCluster cluster-a
+    api->>xp: reconcile XR
+    xp->>xp: fabric (environment-configs) then render (go-templating)
+    xp->>api: NAD vm-net, token, cloud-init Secrets, VMs, kubeconfig Job
+    api->>kv: VirtualMachines
+    kv->>cp: boot (disk cloned from golden image)
+    kv->>wk: boot
+    cp->>cp: cloud-init: static IP, k3s server
+    cp->>cp: helm-controller installs Cilium, BGP config applied
+    wk->>cp: k3s agent joins :6443 with token
+    cp->>frr: eBGP session, announces pod /24
+    wk->>frr: eBGP session, announces pod /24
+    api->>cp: Job waits for 3 Ready nodes, fetches kubeconfig (SSH)
+    api->>api: Secret cluster-a-kubeconfig, XR Ready
+    mk->>op: kubeconfig merged into /root/.kube/config
+```
+
+### Routing between clusters
+
+No overlay: every pod block and LoadBalancer IP is a route on the host,
+learned over BGP and filtered against `site.yml`. The host announces nothing;
+nodes use it as their default gateway.
+
+```mermaid
+flowchart LR
+    subgraph ca["cluster-a · AS 65110"]
+        pa["pods 10.110.x.0/24<br/>(one block per node)"]
+        la["LB IPs 10.250.110.x/32<br/>(from every node)"]
+    end
+
+    subgraph host["Host"]
+        direction TB
+        frr["FRR · AS 65000<br/>accept only own pod and LB CIDR<br/>max 512 prefixes, ECMP 64"]
+        rib["Kernel routes<br/>proto bgp"]
+        frr --> rib
+    end
+
+    subgraph cb["cluster-b · AS 65120"]
+        pb["pods 10.120.x.0/24"]
+        lb["LB IPs 10.250.120.x/32"]
+    end
+
+    pa -- announce --> frr
+    la -- announce --> frr
+    pb -- announce --> frr
+    lb -- announce --> frr
+    rib -- "routed, no SNAT inside 10.0.0.0/8" --> ca
+    rib -- "routed, no SNAT inside 10.0.0.0/8" --> cb
+    rib -- "SNAT to node IP, then host NAT" --> internet(("Internet"))
+```
+
+Details: [Workload clusters](#workload-clusters) and [Networking](#networking).
+
 ## Quick start
 
 On the management host, as root:
