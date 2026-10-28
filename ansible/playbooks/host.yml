@@ -38,34 +38,56 @@
           fs.inotify.max_user_instances: 1024
           fs.inotify.max_user_watches: 1048576
 
-    # --- VM bridge -------------------------------------------------------
-    # br-vms is VLAN-aware: each VM port is an access port of its cluster's
-    # VLAN; the host has one gateway interface (br-vms.<id>) per VLAN.
-    - name: VM networks (untagged + one per VLAN)
+    # --- VM networks -----------------------------------------------------
+    # br-vms: untagged and host-local (smoke-test VM). Each workload cluster
+    # has its own bridge br-<name> with the gateway .1; with vm_uplink set,
+    # <vm_uplink>.<vlan_id> joins it and carries the cluster to other hosts.
+    - name: VM networks (smoke-test bridge + one bridge per cluster)
       ansible.builtin.set_fact:
-        vm_networks: "{{ vm_networks | default([{'iface': vm_bridge, 'cidr': vm_net_cidr}]) + [{'iface': vm_bridge ~ '.' ~ item.id, 'cidr': item.cidr}] }}"
-      loop: "{{ vm_vlans }}"
+        vm_bridges: "{{ vm_bridges | default([{'iface': vm_bridge, 'cidr': vm_net_cidr}]) + [{'iface': 'br-' ~ item.name, 'cidr': item.cidr}] }}"
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: "{{ item.name }}"
 
     - name: Routed address ranges
       ansible.builtin.set_fact:
         fabric_ranges: >-
           {{ [pod_cidr, service_cidr, vm_net_cidr]
-             + vm_vlans | map(attribute='cidr') | list
-             + vm_vlans | map(attribute='pod_cidr') | list
-             + vm_vlans | map(attribute='lb_cidr') | list }}
+             + vm_networks | map(attribute='cidr') | list
+             + vm_networks | map(attribute='pod_cidr') | list
+             + vm_networks | map(attribute='lb_cidr') | list }}
 
-    - name: VLANs, ASNs and address ranges must be unique (site.yml)
+    - name: Cluster networks must be valid and unique (site.yml)
       ansible.builtin.assert:
         that:
-          - vm_vlans | map(attribute='id') | unique | length == vm_vlans | length
-          - (vm_vlans | map(attribute='asn') | unique | list + [fabric_asn]) | unique | length == vm_vlans | length + 1
+          - vm_networks | map(attribute='name') | unique | length == vm_networks | length
+          - vm_networks | map(attribute='vlan_id') | unique | length == vm_networks | length
+          - (vm_networks | map(attribute='asn') | unique | list + [fabric_asn]) | unique | length == vm_networks | length + 1
+          - bad_names == ''
+          - bad_vlans == ''
+          - bad_asns == ''
           - overlaps == ''
           - outside == ''
         fail_msg: >-
-          Duplicate VLAN ID or ASN, or overlapping ranges [{{ overlaps }}], or pod/LB
-          ranges outside fabric_routed_cidr [{{ outside }}].
+          Duplicate name, vlan_id or ASN; names not 1-12 lowercase alphanumerics or '-' [{{ bad_names }}];
+          vlan_id outside {{ vm_vlan_id_range }} [{{ bad_vlans }}]; ASN not private [{{ bad_asns }}];
+          overlapping ranges [{{ overlaps }}]; or pod/LB ranges outside fabric_routed_cidr [{{ outside }}].
         quiet: true
       vars:
+        bad_names: >-
+          {{ vm_networks | map(attribute='name') | reject('match', '^[a-z0-9]([-a-z0-9]{0,10}[a-z0-9])?$') | join(', ') }}
+        bad_vlans: >-
+          {%- set out = [] -%}
+          {%- for n in vm_networks if n.vlan_id | int < vm_vlan_id_range[0] or n.vlan_id | int > vm_vlan_id_range[1] -%}
+          {%- set _ = out.append(n.name ~ ': ' ~ n.vlan_id) -%}{%- endfor -%}
+          {{ out | join(', ') }}
+        # RFC 6996: 64512-65534 and 4200000000-4294967294.
+        bad_asns: >-
+          {%- set out = [] -%}
+          {%- for a in vm_networks | map(attribute='asn') | list + [fabric_asn] -%}
+          {%- if not ((64512 <= a | int <= 65534) or (4200000000 <= a | int <= 4294967294)) -%}{%- set _ = out.append(a) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out | join(', ') }}
         overlaps: >-
           {%- set out = [] -%}
           {%- for a in fabric_ranges -%}{%- for b in fabric_ranges[loop.index:] -%}
@@ -75,7 +97,7 @@
           {{ out | join(', ') }}
         outside: >-
           {%- set out = [] -%}
-          {%- for r in vm_vlans | map(attribute='pod_cidr') | list + vm_vlans | map(attribute='lb_cidr') | list -%}
+          {%- for r in vm_networks | map(attribute='pod_cidr') | list + vm_networks | map(attribute='lb_cidr') | list -%}
           {%- if not fabric_routed_cidr | ansible.utils.network_in_network(r) -%}{%- set _ = out.append(r) -%}{%- endif -%}
           {%- endfor -%}
           {{ out | join(', ') }}
@@ -100,83 +122,183 @@
     - name: Apply networkd settings before FRR installs routes
       ansible.builtin.meta: flush_handlers
 
-    - name: VM bridge netdev
+    - name: Smoke-test bridge
       ansible.builtin.copy:
-        dest: /etc/systemd/network/50-{{ vm_bridge }}.netdev
+        dest: /etc/systemd/network/{{ item.file }}
+        content: "{{ item.content }}"
+      loop:
+        - file: 50-{{ vm_bridge }}.netdev
+          content: |
+            [NetDev]
+            Name={{ vm_bridge }}
+            Kind=bridge
+        - file: 50-{{ vm_bridge }}.network
+          content: |
+            [Match]
+            Name={{ vm_bridge }}
+
+            [Link]
+            RequiredForOnline=no
+
+            [Network]
+            Address={{ vm_net_gateway }}/{{ vm_net_prefix }}
+            ConfigureWithoutCarrier=yes
+            IgnoreCarrierLoss=yes
+      loop_control:
+        label: "{{ item.file }}"
+      notify: Reload networkd
+
+    - name: Cluster bridges
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/50-br-{{ item.name }}.netdev
         content: |
+          # {{ item.name }}
           [NetDev]
-          Name={{ vm_bridge }}
+          Name=br-{{ item.name }}
           Kind=bridge
-
-          [Bridge]
-          VLANFiltering=yes
-          DefaultPVID=1
+          MTUBytes={{ vm_mtu }}
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: br-{{ item.name }}
       notify: Reload networkd
 
-    - name: VM bridge network
+    - name: Cluster gateways
       ansible.builtin.copy:
-        dest: /etc/systemd/network/50-{{ vm_bridge }}.network
-        content: |
-          [Match]
-          Name={{ vm_bridge }}
-
-          [Link]
-          RequiredForOnline=no
-
-          [Network]
-          Address={{ vm_net_gateway }}/{{ vm_net_prefix }}
-          ConfigureWithoutCarrier=yes
-          IgnoreCarrierLoss=yes
-          {% for vlan in vm_vlans %}
-          VLAN={{ vm_bridge }}.{{ vlan.id }}
-          {% endfor %}
-
-          # Bridge "self" port: untagged network on PVID 1, tagged member of
-          # every cluster VLAN so the gateway interfaces see their traffic.
-          [BridgeVLAN]
-          VLAN=1
-          PVID=1
-          EgressUntagged=1
-          {% for vlan in vm_vlans %}
-
-          [BridgeVLAN]
-          VLAN={{ vlan.id }}
-          {% endfor %}
-      notify: Reload networkd
-
-    - name: VLAN gateway netdevs
-      ansible.builtin.copy:
-        dest: /etc/systemd/network/51-{{ vm_bridge }}.{{ item.id }}.netdev
-        content: |
-          [NetDev]
-          Name={{ vm_bridge }}.{{ item.id }}
-          Kind=vlan
-
-          [VLAN]
-          Id={{ item.id }}
-      loop: "{{ vm_vlans }}"
-      notify: Reload networkd
-
-    - name: VLAN gateway networks
-      ansible.builtin.copy:
-        dest: /etc/systemd/network/51-{{ vm_bridge }}.{{ item.id }}.network
+        dest: /etc/systemd/network/50-br-{{ item.name }}.network
         content: |
           # {{ item.name }}
           [Match]
-          Name={{ vm_bridge }}.{{ item.id }}
+          Name=br-{{ item.name }}
 
           [Link]
           RequiredForOnline=no
+          MTUBytes={{ vm_mtu }}
 
           [Network]
           Address={{ item.cidr | ansible.utils.ipaddr('1') }}
           ConfigureWithoutCarrier=yes
           IgnoreCarrierLoss=yes
-          # Only sources routed through this VLAN (its nodes, and the pod and
+          # Only sources routed through this bridge (its nodes, and the pod and
           # LB prefixes its nodes announce): no spoofing of other tenants.
           IPv4ReversePathFilter=strict
-      loop: "{{ vm_vlans }}"
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: br-{{ item.name }}
       notify: Reload networkd
+
+    - name: Cluster VLANs on the uplink
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/51-{{ vm_uplink }}.{{ item.vlan_id }}.netdev
+        content: |
+          # {{ item.name }} towards the other hosts
+          [NetDev]
+          Name={{ vm_uplink }}.{{ item.vlan_id }}
+          Kind=vlan
+          MTUBytes={{ vm_mtu }}
+
+          [VLAN]
+          Id={{ item.vlan_id }}
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: "{{ vm_uplink }}.{{ item.vlan_id }}"
+      when: vm_uplink != ''
+      notify: Reload networkd
+
+    - name: Cluster VLANs join their bridge
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/51-{{ vm_uplink }}.{{ item.vlan_id }}.network
+        content: |
+          [Match]
+          Name={{ vm_uplink }}.{{ item.vlan_id }}
+
+          [Link]
+          RequiredForOnline=no
+
+          [Network]
+          Bridge=br-{{ item.name }}
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: "{{ vm_uplink }}.{{ item.vlan_id }}"
+      when: vm_uplink != ''
+      notify: Reload networkd
+
+    # The uplink's own .network file (e.g. netplan's) must list its VLANs.
+    - name: Find the uplink's network file
+      ansible.builtin.shell: >-
+        networkctl status {{ vm_uplink }} --no-pager | sed -n 's/^ *Network File: //p'
+      register: uplink_network
+      changed_when: false
+      failed_when: uplink_network.stdout == ''
+      when: vm_uplink != ''
+
+    - name: Uplink drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/network/{{ uplink_network.stdout | basename }}.d
+        state: directory
+        mode: "0755"
+      when: vm_uplink != ''
+
+    - name: Attach the cluster VLANs to the uplink
+      ansible.builtin.copy:
+        dest: /etc/systemd/network/{{ uplink_network.stdout | basename }}.d/50-kubevirt-infra.conf
+        content: |
+          [Network]
+          {% for n in vm_networks %}
+          VLAN={{ vm_uplink }}.{{ n.vlan_id }}
+          {% endfor %}
+      when: vm_uplink != ''
+      notify: Reload networkd
+
+    - name: Find uplink drop-ins
+      ansible.builtin.find:
+        paths: /etc/systemd/network
+        patterns: 50-kubevirt-infra.conf
+        recurse: true
+      register: uplink_dropins
+
+    - name: Remove the drop-in of a former uplink
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ uplink_dropins.files | map(attribute='path')
+           | reject('equalto', '/etc/systemd/network/' ~ (uplink_network.stdout | default('') | basename) ~ '.d/50-kubevirt-infra.conf' if vm_uplink else '')
+           | list }}
+      notify: Reload networkd
+
+    - name: VM network files that should exist
+      ansible.builtin.set_fact:
+        vm_net_files: >-
+          {{ ['50-' ~ vm_bridge ~ '.netdev', '50-' ~ vm_bridge ~ '.network']
+             + vm_networks | map(attribute='name') | product(['.netdev', '.network'])
+               | map('join') | map('regex_replace', '^', '50-br-') | list
+             + (vm_networks | map(attribute='vlan_id') | map('string') | product(['.netdev', '.network'])
+               | map('join') | map('regex_replace', '^', '51-' ~ vm_uplink ~ '.') | list if vm_uplink else []) }}
+
+    # Files of removed clusters, an old uplink or the former VLAN layout
+    # (br-vms.<id>). networkd does not delete netdevs, so their links go too.
+    - name: Find VM network files
+      ansible.builtin.find:
+        paths: /etc/systemd/network
+        patterns: ["50-*", "51-*"]
+        file_type: file
+      register: existing_net_files
+
+    - name: Remove stale VM network files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ existing_net_files.files | map(attribute='path') | reject('in', vm_net_files | map('regex_replace', '^', '/etc/systemd/network/') | list) | list }}"
+      register: stale_net_files
+      notify: Reload networkd
+
+    - name: Delete links of removed netdevs
+      ansible.builtin.shell: ip link show {{ item }} >/dev/null 2>&1 && ip link delete {{ item }} || true
+      loop: >-
+        {{ stale_net_files.results | selectattr('changed') | map(attribute='item')
+           | select('match', '.*\.netdev$') | map('basename')
+           | map('regex_replace', '^5[01]-(.*)\.netdev$', '\1') | list }}
+      changed_when: true
 
     # networkd does not change bridge options of an existing bridge.
     - name: Check VLAN filtering on the VM bridge
@@ -185,24 +307,27 @@
       register: vlan_filtering
       failed_when: false
 
-    - name: Recreate the VM bridge with VLAN filtering
+    - name: Recreate the VM bridge without VLAN filtering (former layout)
       ansible.builtin.command: ip link delete {{ vm_bridge }}
-      when: (vlan_filtering.content | default('') | b64decode | trim) == '0'
+      when: (vlan_filtering.content | default('') | b64decode | trim) == '1'
       changed_when: true
       notify: Reload networkd
 
-    - name: Bring up the VM bridge
+    - name: Bring up the VM bridges
       ansible.builtin.meta: flush_handlers
 
-    - name: Check the VM bridge exists
-      ansible.builtin.command: ip -br addr show {{ vm_bridge }}
-      register: bridge
+    - name: Check the VM bridges exist
+      ansible.builtin.command: ip -br link show {{ item.iface }}
+      loop: "{{ vm_bridges }}"
+      loop_control:
+        label: "{{ item.iface }}"
+      register: bridges
       changed_when: false
       failed_when: false
 
-    - name: Create the VM bridge
+    - name: Create the VM bridges
       ansible.builtin.command: networkctl reload
-      when: bridge.rc != 0
+      when: bridges.results | rejectattr('rc', 'equalto', 0) | list | length > 0
       changed_when: true
 
     - name: nftables include directory
@@ -221,8 +346,8 @@
           table ip vm_nat {
             chain postrouting {
               type nat hook postrouting priority srcnat; policy accept;
-              # Only traffic leaving the host; VLAN-to-VLAN traffic is routed as is.
-              ip saddr { {{ vm_networks | map(attribute='cidr') | join(', ') }} } oifname "{{ node_iface }}" masquerade
+              # Only traffic leaving the host; traffic between clusters is routed as is.
+              ip saddr { {{ vm_bridges | map(attribute='cidr') | join(', ') }} } oifname "{{ node_iface }}" masquerade
             }
           }
       notify: Restart vm-nat
@@ -278,6 +403,22 @@
         comment: kubevirt-infra cluster network
       loop: ["{{ pod_cidr }}", "{{ service_cidr }}"]
 
+    # Rules of the former layout (one VLAN-aware br-vms with br-vms.<id>
+    # gateways, every cluster bridged on br-vms).
+    - name: Remove firewall rules of the former VLAN layout
+      ansible.builtin.shell: |
+        changed=0
+        while n=$(ufw status numbered | grep -E "$PATTERN" | head -1 | sed -E 's/^\[ *([0-9]+)\].*/\1/'); [ -n "$n" ]; do
+          ufw --force delete "$n" >/dev/null; changed=1
+        done
+        echo $changed
+      environment:
+        PATTERN: >-
+          on {{ vm_bridge }}\.[0-9]+|({{ (vm_networks | map(attribute='cidr') | list
+          + vm_networks | map(attribute='pod_cidr') | list) | map('regex_escape') | join('|') }}) on {{ vm_bridge }}
+      register: old_rules
+      changed_when: old_rules.stdout == '1'
+
     # VMs never reach the host itself (incoming default deny) nor the
     # management cluster's pod/service networks.
     - name: VMs may not reach management cluster networks
@@ -288,7 +429,9 @@
         from_ip: "{{ item.0.cidr }}"
         to_ip: "{{ item.1 }}"
         comment: kubevirt-infra VMs to mgmt
-      loop: "{{ vm_networks | product([pod_cidr, service_cidr]) | list }}"
+      loop: "{{ vm_bridges | product([pod_cidr, service_cidr]) | list }}"
+      loop_control:
+        label: "{{ item.0.iface }} -> {{ item.1 }}"
 
     - name: VMs may reach the internet
       community.general.ufw:
@@ -298,56 +441,62 @@
         interface_out: "{{ node_iface }}"
         from_ip: "{{ item.cidr }}"
         comment: kubevirt-infra VM egress
-      loop: "{{ vm_networks }}"
+      loop: "{{ vm_bridges }}"
+      loop_control:
+        label: "{{ item.iface }}"
 
     # br_netfilter passes bridged frames through FORWARD as well.
     - name: VMs in the same network may reach each other
       community.general.ufw:
         rule: allow
         route: true
-        interface_in: "{{ vm_bridge }}"
-        interface_out: "{{ vm_bridge }}"
+        interface_in: "{{ item.iface }}"
+        interface_out: "{{ item.iface }}"
         from_ip: "{{ item.cidr }}"
         comment: kubevirt-infra VM egress
-      loop: "{{ vm_networks }}"
+      loop: "{{ vm_bridges }}"
+      loop_control:
+        label: "{{ item.iface }}"
 
     # Same-cluster pod traffic between nodes is bridged (autoDirectNodeRoutes).
     - name: Pods of a cluster may reach each other
       community.general.ufw:
         rule: allow
         route: true
-        interface_in: "{{ vm_bridge }}"
-        interface_out: "{{ vm_bridge }}"
+        interface_in: br-{{ item.name }}
+        interface_out: br-{{ item.name }}
         from_ip: "{{ item.pod_cidr }}"
         comment: kubevirt-infra same-cluster pods
-      loop: "{{ vm_vlans }}"
+      loop: "{{ vm_networks }}"
+      loop_control:
+        label: br-{{ item.name }}
 
-    # Between clusters: everything routed from one VLAN interface to another,
+    # Between clusters: everything routed from one cluster bridge to another,
     # i.e. node IPs, pod IPs and LoadBalancer IPs, without NAT. Strict
-    # rp_filter on br-vms.<id> limits sources to the VLAN's own prefixes.
+    # rp_filter on br-<name> limits sources to the cluster's own prefixes.
     - name: Clusters may reach each other
       community.general.ufw:
         rule: allow
         route: true
-        interface_in: "{{ vm_bridge }}.{{ item.0.id }}"
-        interface_out: "{{ vm_bridge }}.{{ item.1.id }}"
+        interface_in: br-{{ item.0.name }}
+        interface_out: br-{{ item.1.name }}
         comment: kubevirt-infra inter-cluster
-      loop: "{{ vm_vlans | product(vm_vlans) | list }}"
+      loop: "{{ vm_networks | product(vm_networks) | list }}"
       loop_control:
         label: "{{ item.0.name }} -> {{ item.1.name }}"
-      when: item.0.id != item.1.id
+      when: item.0.name != item.1.name
 
     - name: Workload nodes may open BGP sessions to their gateway
       community.general.ufw:
         rule: allow
         direction: in
-        interface: "{{ vm_bridge }}.{{ item.id }}"
+        interface: br-{{ item.name }}
         proto: tcp
         from_ip: "{{ item.cidr }}"
         to_ip: "{{ item.cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address') }}"
         to_port: "179"
         comment: kubevirt-infra BGP
-      loop: "{{ vm_vlans }}"
+      loop: "{{ vm_networks }}"
       loop_control:
         label: "{{ item.name }}"
 
@@ -358,7 +507,9 @@
         from_ip: "{{ pod_cidr }}"
         to_ip: "{{ item.cidr }}"
         comment: kubevirt-infra pods to VMs
-      loop: "{{ vm_networks }}"
+      loop: "{{ vm_bridges }}"
+      loop_control:
+        label: "{{ item.iface }}"
 
     - name: Pods may reach workload pods and LoadBalancer IPs
       community.general.ufw:
@@ -367,7 +518,7 @@
         from_ip: "{{ pod_cidr }}"
         to_ip: "{{ item }}"
         comment: kubevirt-infra pods to VMs
-      loop: "{{ vm_vlans | map(attribute='pod_cidr') | list + vm_vlans | map(attribute='lb_cidr') | list }}"
+      loop: "{{ vm_networks | map(attribute='pod_cidr') | list + vm_networks | map(attribute='lb_cidr') | list }}"
 
     - name: Enable firewall
       community.general.ufw:
@@ -529,15 +680,17 @@
         state: restarted
       register: frr_restart
 
-    # A restart already loaded the new configuration.
+    # Applies the difference to the running daemons; BGP sessions stay up.
+    # Not `systemctl reload frr`: it restarts watchfrr, which systemd takes
+    # for a stop. A restart already loaded the new configuration.
     - name: Reload frr
-      ansible.builtin.systemd_service:
-        name: frr
-        state: reloaded
+      ansible.builtin.command: /usr/lib/frr/frr-reload.py --reload /etc/frr/frr.conf
+      changed_when: true
       when: frr_restart is not defined or frr_restart is skipped
 
+    # Creates new netdevs and reconfigures links whose .network changed.
     - name: Reload networkd
-      ansible.builtin.shell: networkctl reload && networkctl reconfigure {{ vm_bridge }}
+      ansible.builtin.command: networkctl reload
       changed_when: true
 
     - name: Restart vm-nat

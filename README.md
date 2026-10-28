@@ -2,7 +2,7 @@
 
 Code for a single-node **management cluster** that runs virtual machines with
 KubeVirt and provisions **workload Kubernetes clusters** (k3s + Cilium) on those
-VMs through a Crossplane API, one VLAN per cluster. Workload clusters route
+VMs through a Crossplane API, one bridge per cluster. Workload clusters route
 pods natively (no overlay) and announce pod CIDRs and LoadBalancer IPs over
 BGP to the host, which plays the fabric.
 
@@ -14,13 +14,13 @@ BGP to the host, which plays the fabric.
 │   ├─ Multus, KubeVirt + CDI ─ golden image vm-images/ubuntu-2404             │
 │   └─ Crossplane 2 ─ KubernetesCluster API (crossplane/)                      │
 │                                                                              │
-│  FRR (AS 65000) ─ eBGP with every workload node, routes pods + LB IPs         │
-│  br-vms (VLAN-aware bridge)                         NAT ──► internet         │
-│   ├─ untagged   192.168.100.0/24  gw br-vms      test-vm                     │
-│   ├─ VLAN 110   192.168.110.0/24  gw br-vms.110  cluster-a: cp .10, wk .11-.12│
-│   │             AS 65110, pods 10.110.0.0/16, LB 10.250.110.0/24             │
-│   └─ VLAN 120   192.168.120.0/24  gw br-vms.120  cluster-b: cp .10, wk .11-.12│
-│                 AS 65120, pods 10.120.0.0/16, LB 10.250.120.0/24             │
+│  FRR (AS 65000) ─ eBGP with every workload node, routes pods + LB IPs        │
+│  VM bridges (MTU 1350 for clusters)                 NAT ──► internet         │
+│   ├─ br-vms        192.168.100.0/24  test-vm                                 │
+│   ├─ br-cluster-a  192.168.110.0/24  cluster-a: cp .10, wk .11-.12           │
+│   │                VLAN 4010, AS 65010, pods 10.110.0.0/16, LB 10.250.110.0/24│
+│   └─ br-cluster-b  192.168.120.0/24  cluster-b: cp .10, wk .11-.12           │
+│                    VLAN 4020, AS 65020, pods 10.120.0.0/16, LB 10.250.120.0/24│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -28,10 +28,10 @@ BGP to the host, which plays the fabric.
 
 ### Topology
 
-The host owns the network: one VLAN per workload cluster on `br-vms`, a
-gateway per VLAN, FRR peering with every workload node, UFW and NAT. The
-management cluster runs the VMs (KubeVirt) and the `KubernetesCluster` API
-(Crossplane); workload clusters only see their own VLAN.
+The host owns the network: one bridge per workload cluster with its gateway
+`.1`, FRR peering with every workload node, UFW and NAT. The management
+cluster runs the VMs (KubeVirt) and the `KubernetesCluster` API (Crossplane);
+workload clusters only see their own bridge.
 
 ```mermaid
 flowchart TB
@@ -42,7 +42,7 @@ flowchart TB
         direction TB
         nic["enp5s0 · public IP"]
         fw["UFW + NAT (vm-nat)"]
-        frr["FRR · AS 65000<br/>passive eBGP per VLAN"]
+        frr["FRR · AS 65000<br/>passive eBGP per cluster"]
 
         subgraph mgmt["Management cluster · k3s + Cilium"]
             direction LR
@@ -52,29 +52,29 @@ flowchart TB
             img[("Golden image<br/>ubuntu-2404")]
         end
 
-        subgraph bridge["br-vms · VLAN-aware bridge"]
+        subgraph bridge["VM bridges · one per cluster"]
             direction LR
             g100["br-vms<br/>192.168.100.1"]
-            g110["br-vms.110<br/>192.168.110.1"]
-            g120["br-vms.120<br/>192.168.120.1"]
+            g110["br-cluster-a<br/>192.168.110.1"]
+            g120["br-cluster-b<br/>192.168.120.1"]
         end
     end
 
-    subgraph ca["cluster-a · VLAN 110 · AS 65110"]
+    subgraph ca["cluster-a · VLAN 4010 · AS 65010"]
         direction LR
         a0["cp-0 .10"]
         a1["worker-0 .11"]
         a2["worker-1 .12"]
     end
 
-    subgraph cb["cluster-b · VLAN 120 · AS 65120"]
+    subgraph cb["cluster-b · VLAN 4020 · AS 65020"]
         direction LR
         b0["cp-0 .10"]
         b1["worker-0 .11"]
         b2["worker-1 .12"]
     end
 
-    testvm["test-vm<br/>untagged"]
+    testvm["test-vm"]
 
     internet <--> nic
     admin -- "SSH, HTTP (admin_sources)" --> nic
@@ -132,7 +132,7 @@ nodes use it as their default gateway.
 
 ```mermaid
 flowchart LR
-    subgraph ca["cluster-a · AS 65110"]
+    subgraph ca["cluster-a · AS 65010"]
         pa["pods 10.110.x.0/24<br/>(one block per node)"]
         la["LB IPs 10.250.110.x/32<br/>(from every node)"]
     end
@@ -144,7 +144,7 @@ flowchart LR
         frr --> rib
     end
 
-    subgraph cb["cluster-b · AS 65120"]
+    subgraph cb["cluster-b · AS 65020"]
         pb["pods 10.120.x.0/24"]
         lb["LB IPs 10.250.120.x/32"]
     end
@@ -159,6 +159,50 @@ flowchart LR
 ```
 
 Details: [Workload clusters](#workload-clusters) and [Networking](#networking).
+
+## Evolution
+
+The platform was built in steps; each one is a commit (or more) and left the
+code able to rebuild everything from scratch.
+
+1. **Management cluster** (`366c209`). Single-node k3s with embedded etcd,
+   Cilium as CNI and kube-proxy replacement, Hubble. Multus, KubeVirt and CDI
+   run VMs from a golden image (`vm-images/ubuntu-2404`); the smoke-test VM
+   sits on the host bridge `br-vms`, NATed to the internet. Crossplane 2 with
+   its functions is installed for the API that follows. UFW: inbound only from
+   `admin_sources`.
+2. **Workload clusters as an API** (`c6b217a`). The namespaced
+   `KubernetesCluster` XRD and its Composition turn one object into k3s +
+   Cilium VMs: cloud-init per node, join token, kubeconfig Job, status. One
+   VLAN per cluster on a VLAN-aware `br-vms` (110, 120) with a gateway
+   `br-vms.<id>` per VLAN; clusters routed to each other by the host, blocked
+   from the host and the management networks. LoadBalancer IPs came from a
+   range of the node subnet, announced with Cilium L2 announcements (ARP).
+3. **Kubeconfig merge and Gateway API** (`0eb288f`). All kubeconfigs merged
+   into `/root/.kube/config` (`kubectx cluster-a`), rebuilt whenever k3s
+   rewrites its own. Cilium Gateway API in host network mode on the
+   management cluster (`Gateway gateway/homelab` on :80).
+4. **Native routing and a BGP fabric** (`4aa27cb`). No more overlay in the
+   workload clusters: pods are routed natively and every node announces its
+   pod block and every LoadBalancer IP (/32, own `loadBalancerCIDR` outside the
+   node subnet) to FRR on the host, which plays the fabric (AS 65000, inbound
+   filters per cluster, ECMP, announces nothing). Pods keep their IP towards
+   `10.0.0.0/8`, strict reverse-path filtering per VLAN, service CIDR
+   `172.20.0.0/16` shared by all clusters. Failover measured and tuned (hold
+   timer 9s, graceful restart 120s, drain label). Fabric values reach the
+   Composition through the EnvironmentConfig `fabric`.
+5. **Architecture diagrams** (`1c74003`). The Mermaid diagrams above.
+6. **One bridge per cluster, multi-host ready.** Each cluster gets its own
+   bridge `br-<name>` instead of a VLAN on the shared `br-vms`. `vlan_id`
+   becomes the cluster's segment between hosts (Hetzner vSwitch IDs, 4010 and
+   4020), carried by `<vm_uplink>.<vlan_id>` once a second host joins. MTU 1350
+   on bridges, VMs and pods: a vSwitch carries 1400 and VXLAN over it would take
+   50 more. ASNs move to 65000 + 10 per cluster (65010, 65020). `make host`
+   now cleans up what the previous layout left (files, links, firewall rules)
+   and applies FRR changes with `frr-reload.py`.
+
+Next: public ingress for tenant apps through HAProxy on the host, with Gateway
+API removed from the management cluster.
 
 ## Quick start
 
@@ -179,7 +223,7 @@ target converges the host back to the code.
 
 | Target | What it does |
 |---|---|
-| `host` | Package upgrades, sysctls, CNI plugins, VM bridge `br-vms`, NAT (`vm-nat.service`), BGP fabric (FRR), UFW rules, helm/virtctl, host SSH key for VMs |
+| `host` | Package upgrades, sysctls, CNI plugins, VM bridges (`br-vms`, `br-<cluster>`), NAT (`vm-nat.service`), BGP fabric (FRR), UFW rules, helm/virtctl, host SSH key for VMs |
 | `k3s` | k3s with `ansible/templates/k3s-config.yaml.j2` (no flannel, kube-proxy, traefik, servicelb), Gateway API CRDs and Cilium |
 | `platform` | Multus, KubeVirt, CDI, VM network, golden image, Crossplane + functions + RBAC, Gateway |
 | `vendor` | Re-download pinned upstream manifests into `platform/*/upstream` |
@@ -206,7 +250,7 @@ platform/
   multus/                       vendored thick-plugin manifest + patches
   kubevirt/{operator,config}/   vendored operator + KubeVirt CR
   cdi/{operator,config}/        vendored operator + CDI CR
-  vm-network/                   NetworkAttachmentDefinition for br-vms
+  vm-network/                   NetworkAttachmentDefinition for br-vms (test VM)
   images/                       golden image DataVolume + clone RBAC
   crossplane/                   Helm values, functions, RBAC
 vms/test-vm/                    smoke-test VM
@@ -225,9 +269,9 @@ metadata: {name: cluster-a, namespace: cluster-a}
 spec:
   running: true                     # false: stop the VMs, keep the disks
   network:
-    vlanId: 110
+    vlanId: 4010                    # segment between hosts (vSwitch VLAN)
     subnet: 192.168.110.0/24        # host is .1; nodes from nodeIPStart (10)
-    asn: 65110                      # BGP AS of the cluster's nodes
+    asn: 65010                      # BGP AS of the cluster's nodes
     podCIDR: 10.110.0.0/16          # routed, announced per node
     loadBalancerCIDR: 10.250.110.0/24  # routed, announced as /32s
     serviceCIDR: 172.20.0.0/16      # default; never leaves the cluster
@@ -245,9 +289,9 @@ file when k3s rewrites `/etc/rancher/k3s/k3s.yaml`. The
 composition (`crossplane/composition.yaml`, function-go-templating) creates, in
 the cluster's namespace:
 
-* `vm-net`: bridge CNI on `br-vms` with the cluster's VLAN and MAC spoof check.
+* `vm-net`: bridge CNI on the cluster's bridge `br-<name>`, MTU and MAC spoof check.
 * the k3s join token (generated once) and a cloud-init Secret per node: static
-  IP/MAC derived from the subnet, k3s server or agent.
+  IP/MAC derived from the subnet, MTU from the fabric, k3s server or agent.
 * one `VirtualMachine` per node, disk cloned from the golden image, single NIC
   on `vm-net` (the guest is not on the pod network).
 * a Job that waits until all nodes are Ready, then stores the kubeconfig in
@@ -256,19 +300,21 @@ the cluster's namespace:
 Inside the VMs, k3s runs without flannel/kube-proxy/traefik/servicelb. k3s's
 helm-controller installs Cilium at boot: kube-proxy replacement with Maglev,
 native routing, BGP control plane, LB IPAM from `loadBalancerCIDR`, Hubble.
-The fabric's AS and routed range come from the EnvironmentConfig `fabric`,
-written by `make clusters` from `site.yml` (`fabric_asn`, `fabric_routed_cidr`)
-and read by function-environment-configs.
+The fabric's AS, routed range and MTU come from the EnvironmentConfig
+`fabric`, written by `make clusters` from `site.yml` (`fabric_asn`,
+`fabric_routed_cidr`, `vm_mtu`) and read by function-environment-configs.
 
 Validation (CEL in `crossplane/xrd.yaml`): /24 subnet, node IPs in the subnet,
 CIDRs valid, `vlanId`/`subnet`/`asn`/CIDRs/`clusterId` immutable. `make clusters`
-checks each cluster against its `vm_vlans` entry and that VLANs and cluster
-IDs are unique; `make host` checks that no two ranges overlap. Scaling
+checks each cluster against the `vm_networks` entry of the same name and that
+VLANs and cluster IDs are unique; `make host` checks names (at most 12
+characters, the bridge `br-<name>` must fit Linux's 15), VLAN IDs
+(`vm_vlan_id_range`), private ASNs and that no two ranges overlap. Scaling
 `workers.replicas` (0-8) is supported.
 
-**Adding a cluster:** add its entry to `vm_vlans` in `site.yml` (VLAN, subnet,
-ASN, pod and LB CIDRs), `make host`, add `clusters/<name>/{namespace,cluster}.yaml`
-with the same values, `make clusters`.
+**Adding a cluster:** add its entry to `vm_networks` in `site.yml` (name,
+VLAN, subnet, ASN, pod and LB CIDRs; conventions in the file), `make host`, add
+`clusters/<name>/{namespace,cluster}.yaml` with the same values, `make clusters`.
 
 ## Exposing apps (Gateway API)
 
@@ -300,17 +346,21 @@ Ubuntu image build (`platform/images/ubuntu-2404.yaml`).
 ## Networking
 
 * **Pods:** Cilium, `10.42.0.0/16`; services `10.43.0.0/16`.
-* **VMs:** one NIC on `br-vms` (Multus secondary network, KubeVirt bridge
-  binding), one bridge port per VM. The virt-launcher pod keeps its Cilium pod
-  network; the VM does not use it. Addresses are static, set by cloud-init from
-  the VM's fixed MAC.
-* **VLANs:** `br-vms` filters VLANs. Each workload cluster's VM ports are
-  access ports of its VLAN; the host has a gateway interface `br-vms.<id>` on
-  `.1` per VLAN (`vm_vlans` in `site.yml`). The untagged network (PVID 1,
-  `192.168.100.0/24`) is used by the test VM.
+* **VMs:** one NIC on their cluster's bridge (Multus secondary network,
+  KubeVirt bridge binding), one bridge port per VM. The virt-launcher pod keeps
+  its Cilium pod network; the VM does not use it. Addresses are static, set by
+  cloud-init from the VM's fixed MAC.
+* **Bridges:** one per workload cluster, `br-<name>`, with the gateway on `.1`
+  (`vm_networks` in `site.yml`); `br-vms` (`192.168.100.0/24`) is the test VM's.
+  Cluster bridges, VMs and so pods use MTU `vm_mtu` (1350).
+* **Multiple hosts:** each cluster's `vlan_id` is its segment between hosts.
+  With `vm_uplink` set (e.g. the Hetzner vSwitch NIC), `<vm_uplink>.<vlan_id>`
+  joins `br-<name>` on every host. Hetzner vSwitch IDs are 4000-4091 and carry
+  1400 bytes; 1350 leaves room for VXLAN (50 bytes) if the clusters move to one
+  VNI each over a single vSwitch, without touching the VMs.
 * **BGP fabric:** FRR on the host (AS `fabric_asn`, `ansible/templates/frr.conf.j2`)
-  has one passive peer group per cluster (`bgp listen range` = the VLAN
-  subnet, `remote-as` = the cluster's ASN). Every node opens a session to its
+  has one passive peer group per cluster (`bgp listen range` = the cluster's
+  subnet, `remote-as` = the cluster's ASN: private, 65000 + 10 per cluster). Every node opens a session to its
   default gateway (Cilium `autoDiscovery: DefaultGateway`) and announces its pod
   block plus every LoadBalancer IP as a /32 (`externalTrafficPolicy: Cluster`,
   so all nodes do; the host spreads flows over them with ECMP, 5-tuple hash).
@@ -331,14 +381,14 @@ Ubuntu image build (`platform/images/ubuntu-2404.yaml`).
   sessions cleanly and keeps its routes for up to 120s. Existing connections
   to a node that leaves the ECMP set are reset (flows are rehashed).
 * **Native routing:** no VXLAN. Nodes of a cluster route pod blocks to each
-  other on their VLAN (`autoDirectNodeRoutes`); other clusters are reached
+  other on their bridge (`autoDirectNodeRoutes`); other clusters are reached
   through the host. Pods keep their IP towards `fabric_routed_cidr`
   (`10.0.0.0/8`: all clusters' pods and LB IPs) and are masqueraded to the node
   IP otherwise (internet, node IPs), then to the host IP by `vm-nat`.
-* **Anti-spoofing:** strict reverse-path filtering on each `br-vms.<id>`: a
-  VLAN can only send from its subnet and the prefixes its nodes announced.
+* **Anti-spoofing:** strict reverse-path filtering on each `br-<name>`: a
+  cluster can only send from its subnet and the prefixes its nodes announced.
 * **Firewall (UFW):** inbound to the host only from `admin_sources`, plus BGP
-  (179/tcp) from each VLAN to its gateway.
+  (179/tcp) from each cluster bridge to its gateway.
 
   | From | To | |
   |---|---|---|
@@ -368,5 +418,14 @@ Ubuntu image build (`platform/images/ubuntu-2404.yaml`).
   there for Multus' `bridge` delegate.
 * `kubernetes.core.helm` does not support Helm 4 yet; playbooks call
   `helm upgrade --install` directly.
+* `systemctl reload frr` (FRR 10.5) restarts watchfrr, which systemd takes for
+  a stop: the service ends up stopped. Configuration changes are applied with
+  `frr-reload.py --reload` instead, which keeps the BGP sessions.
+* networkd neither deletes netdevs whose file is gone nor changes options of an
+  existing bridge: `make host` deletes the links of removed networks itself.
 * `local-path` is `WaitForFirstConsumer`; the golden image requests immediate
   binding so it imports without a VM.
+
+## Acknowledgements
+
+Built with the help of [Claude Code](https://claude.com/claude-code).

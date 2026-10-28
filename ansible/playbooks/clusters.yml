@@ -61,22 +61,24 @@
 
     # site.yml is the fabric's policy (FRR filters, firewall); host.yml
     # checks that its ranges are unique.
-    - name: Each cluster must match its VLAN on the host (site.yml vm_vlans)
+    - name: Each cluster must match its network on the host (site.yml vm_networks)
       ansible.builtin.assert:
         that:
-          - vlan | length == 1
-          - vlan[0].cidr == net.subnet
-          - vlan[0].asn == net.asn
-          - vlan[0].pod_cidr == net.podCIDR
-          - vlan[0].lb_cidr == net.loadBalancerCIDR
+          - site | length == 1
+          - site[0].vlan_id == net.vlanId
+          - site[0].cidr == net.subnet
+          - site[0].asn == net.asn
+          - site[0].pod_cidr == net.podCIDR
+          - site[0].lb_cidr == net.loadBalancerCIDR
         fail_msg: >-
-          {{ item.xr.metadata.name }}: VLAN {{ net.vlanId }} (subnet {{ net.subnet }}, asn {{ net.asn }},
-          podCIDR {{ net.podCIDR }}, loadBalancerCIDR {{ net.loadBalancerCIDR }}) does not match vm_vlans.
+          {{ item.xr.metadata.name }}: vlanId {{ net.vlanId }}, subnet {{ net.subnet }}, asn {{ net.asn }},
+          podCIDR {{ net.podCIDR }}, loadBalancerCIDR {{ net.loadBalancerCIDR }} do not match the
+          vm_networks entry named {{ item.xr.metadata.name }} (its bridge is br-{{ item.xr.metadata.name }}).
           Fix ansible/group_vars/all/site.yml and run `make host`, or fix the cluster.
         quiet: true
       vars:
         net: "{{ item.xr.spec.network }}"
-        vlan: "{{ vm_vlans | selectattr('id', 'equalto', item.xr.spec.network.vlanId) | list }}"
+        site: "{{ vm_networks | selectattr('name', 'equalto', item.xr.metadata.name) | list }}"
       loop: "{{ clusters }}"
       loop_control:
         label: "{{ item.xr.metadata.name }}"
@@ -108,6 +110,7 @@
           data:
             asn: "{{ fabric_asn | int }}"
             routedCIDRs: ["{{ fabric_routed_cidr }}"]
+            mtu: "{{ vm_mtu | int }}"
       changed_when: false
 
     - name: Wait for the API to be established

@@ -7,25 +7,34 @@ kubeconfig: /etc/rancher/k3s/k3s.yaml
 # Management + workload clusters, for kubectl/kubectx in login shells.
 merged_kubeconfig: /root/.kube/config
 
-# VLAN-aware bridge for VMs, NATed to the internet through node_iface.
-# The bridge name is also referenced in platform/vm-network/vm-net.yaml and
-# crossplane/composition.yaml.
+# Bridge of the smoke-test VM (untagged, host-local), NATed to the internet
+# through node_iface. Also referenced in platform/vm-network/vm-net.yaml.
 vm_bridge: br-vms
-# Untagged network (smoke-test VM).
 vm_net_cidr: 192.168.100.0/24
 vm_net_gateway: 192.168.100.1
 vm_net_prefix: 24
 vm_dns: [1.1.1.1, 9.9.9.9]
 
-# One VLAN per workload cluster. The host owns .1 of each subnet as gateway
-# and BGP peer. Each cluster's nodes announce its pod CIDR and LoadBalancer
-# IPs from AS `asn`; the host (FRR) accepts nothing else from that VLAN, so
-# these entries are the fabric's policy, not the tenant's. Must match
-# spec.network of clusters/<name>/cluster.yaml (checked by `make clusters`);
-# no two ranges may overlap (checked by `make host`).
-vm_vlans:
-  - {id: 110, name: cluster-a, cidr: 192.168.110.0/24, asn: 65110, pod_cidr: 10.110.0.0/16, lb_cidr: 10.250.110.0/24}
-  - {id: 120, name: cluster-b, cidr: 192.168.120.0/24, asn: 65120, pod_cidr: 10.120.0.0/16, lb_cidr: 10.250.120.0/24}
+# One network per workload cluster: its own bridge br-<name>, the host owning
+# .1 of the subnet as gateway and BGP peer. Each cluster's nodes announce its
+# pod CIDR and LoadBalancer IPs from AS `asn`; the host (FRR) accepts nothing
+# else from that bridge, so these entries are the fabric's policy, not the
+# tenant's. Must match spec.network of clusters/<name>/cluster.yaml (checked
+# by `make clusters`); no two ranges may overlap (checked by `make host`).
+#   name     cluster name, at most 12 characters (bridge br-<name> <= 15)
+#   vlan_id  the cluster's segment between hosts: tagged on vm_uplink
+#            (Hetzner vSwitch IDs are 4000-4091), later a VXLAN VNI
+#   asn      private, 65000 + 10 per cluster
+vm_networks:
+  - {name: cluster-a, vlan_id: 4010, cidr: 192.168.110.0/24, asn: 65010, pod_cidr: 10.110.0.0/16, lb_cidr: 10.250.110.0/24}
+  - {name: cluster-b, vlan_id: 4020, cidr: 192.168.120.0/24, asn: 65020, pod_cidr: 10.120.0.0/16, lb_cidr: 10.250.120.0/24}
+vm_vlan_id_range: [4000, 4091]
+# Interface carrying the cluster VLANs to the other hosts: <uplink>.<vlan_id>
+# joins br-<name>. Empty on a single host.
+vm_uplink: ""
+# MTU of cluster bridges, VMs and pods: a Hetzner vSwitch carries 1400, VXLAN
+# over it takes 50 more.
+vm_mtu: 1350
 
 # The fabric: FRR on the host, one eBGP session per workload node.
 fabric_asn: 65000

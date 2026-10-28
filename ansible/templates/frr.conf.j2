@@ -1,6 +1,6 @@
 ! Managed by kubevirt-infra (ansible/playbooks/host.yml). The host is the
-! fabric: one passive eBGP peer group per workload cluster (vm_vlans), whose
-! nodes connect from their VLAN. Inbound: only the cluster's pod CIDR (per-node
+! fabric: one passive eBGP peer group per workload cluster (vm_networks), whose
+! nodes connect from their bridge br-<name>. Inbound: only the cluster's pod CIDR (per-node
 ! blocks) and LoadBalancer /32s. Outbound: nothing, nodes route via their
 ! default gateway (this host).
 frr defaults datacenter
@@ -8,12 +8,12 @@ hostname {{ inventory_hostname }}
 log syslog informational
 service integrated-vtysh-config
 !
-{% for t in vm_vlans %}
+{% for t in vm_networks %}
 ip prefix-list {{ t.name }}-in seq 10 permit {{ t.pod_cidr }} le 32
 ip prefix-list {{ t.name }}-in seq 20 permit {{ t.lb_cidr }} ge 32
 {% endfor %}
 !
-{% for t in vm_vlans %}
+{% for t in vm_networks %}
 route-map {{ t.name }}-in permit 10
  match ip address prefix-list {{ t.name }}-in
 exit
@@ -32,10 +32,10 @@ router bgp {{ fabric_asn }}
  no bgp graceful-restart notification
  no bgp default ipv4-unicast
  bgp listen limit 1000
-{% for t in vm_vlans %}
+{% for t in vm_networks %}
  neighbor {{ t.name }} peer-group
  neighbor {{ t.name }} remote-as {{ t.asn }}
- neighbor {{ t.name }} description workload cluster {{ t.name }} (VLAN {{ t.id }})
+ neighbor {{ t.name }} description workload cluster {{ t.name }} (br-{{ t.name }}, VLAN {{ t.vlan_id }})
  neighbor {{ t.name }} timers 3 9
  bgp listen range {{ t.cidr }} peer-group {{ t.name }}
 {% endfor %}
@@ -43,7 +43,7 @@ router bgp {{ fabric_asn }}
  address-family ipv4 unicast
   ! ECMP: a LoadBalancer IP announced by every node of a cluster.
   maximum-paths 64
-{% for t in vm_vlans %}
+{% for t in vm_networks %}
   neighbor {{ t.name }} activate
   neighbor {{ t.name }} soft-reconfiguration inbound
   ! One pod block + up to 256 LoadBalancer IPs per node.

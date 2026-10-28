@@ -59,7 +59,8 @@ spec:
             {{- end }}
             {{- $desired := len $nodes }}
             ---
-            # Secondary network: access port of the cluster's VLAN on br-vms.
+            # Secondary network: a port on the cluster's own bridge br-<name>
+            # (one per host, ansible/playbooks/host.yml).
             apiVersion: k8s.cni.cncf.io/v1
             kind: NetworkAttachmentDefinition
             metadata:
@@ -70,8 +71,8 @@ spec:
                 gotemplating.fn.crossplane.io/ready: "True"  # no status to wait for
             spec:
               config: |
-                {"cniVersion": "0.3.1", "name": "vm-net", "type": "bridge", "bridge": "br-vms",
-                 "vlan": {{ int $net.vlanId }}, "macspoofchk": true, "ipam": {}}
+                {"cniVersion": "0.3.1", "name": "vm-net", "type": "bridge", "bridge": "br-{{ $name }}",
+                 "mtu": {{ int $fabric.mtu }}, "macspoofchk": true, "ipam": {}}
             ---
             apiVersion: v1
             kind: Secret
@@ -105,6 +106,8 @@ spec:
                     match:
                       macaddress: "{{ $mac }}"
                     set-name: eth0
+                    # Fits a Hetzner vSwitch, and VXLAN over it, between hosts.
+                    mtu: {{ int $fabric.mtu }}
                     addresses: [{{ $node.ip }}/24]
                     routes:
                       - to: default
@@ -171,7 +174,7 @@ spec:
                             replicas: 1
                           devices: [eth0]
                           # No overlay: nodes of the cluster route pod blocks to
-                          # each other on the VLAN, everything else goes to the
+                          # each other on their bridge, everything else goes to the
                           # fabric, which learns the pod blocks over BGP.
                           routingMode: native
                           ipv4NativeRoutingCIDR: {{ $net.podCIDR }}
@@ -332,7 +335,7 @@ spec:
                         - name: vmnet
                           bridge: {}
                           macAddress: "{{ $mac }}"
-                  # Only the VLAN network: the guest has a single NIC on br-vms.
+                  # Only the cluster network: the guest has a single NIC on br-<name>.
                   networks:
                     - name: vmnet
                       multus:

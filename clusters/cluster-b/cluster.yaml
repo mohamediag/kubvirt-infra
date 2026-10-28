@@ -7,10 +7,10 @@ metadata:
 spec:
   running: true
   network:
-    vlanId: 120
+    vlanId: 4020
     subnet: 192.168.120.0/24
     nodeIPStart: 10
-    asn: 65120
+    asn: 65020
     podCIDR: 10.120.0.0/16
     loadBalancerCIDR: 10.250.120.0/24
     serviceCIDR: 172.20.0.0/16

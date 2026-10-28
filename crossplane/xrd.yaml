@@ -49,19 +49,21 @@ spec:
                   required: [vlanId, subnet, asn, podCIDR, loadBalancerCIDR]
                   description: >-
                     vlanId, subnet, asn, podCIDR and loadBalancerCIDR must match the
-                    cluster's entry in vm_vlans of ansible/group_vars/all/site.yml: the
-                    fabric only accepts those prefixes from that VLAN.
+                    cluster's entry in vm_networks of ansible/group_vars/all/site.yml: the
+                    fabric only accepts those prefixes from the cluster's bridge br-<name>.
                   properties:
                     vlanId:
                       type: integer
                       minimum: 2
                       maximum: 4094
-                      description: Must be listed in vm_vlans of ansible/group_vars/all/site.yml.
+                      description: >-
+                        The cluster's segment between hosts (VLAN on the uplink, later a
+                        VXLAN VNI). Must match vm_networks of ansible/group_vars/all/site.yml.
                       x-kubernetes-validations:
                         - {rule: self == oldSelf, message: vlanId is immutable}
                     subnet:
                       type: string
-                      description: The VLAN's /24. The host is the gateway on .1.
+                      description: The cluster network's /24. The host is the gateway on .1.
                       x-kubernetes-validations:
                         - rule: isCIDR(self) && cidr(self).ip().family() == 4 && cidr(self).prefixLength() == 24 && cidr(self).masked() == cidr(self)
                           message: subnet must be an IPv4 network address with prefix /24, e.g. 192.168.110.0/24

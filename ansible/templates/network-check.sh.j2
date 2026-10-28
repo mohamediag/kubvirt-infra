@@ -8,8 +8,12 @@ check() {
   if [ "$got" = "$want" ]; then echo "PASS $desc: $got"; else echo "FAIL $desc: want $want, got $got"; fi
 }
 check reachable "internet (https://cloud-images.ubuntu.com)" curl -fsS -m 10 -o /dev/null https://cloud-images.ubuntu.com
+check reachable "eth0 MTU {{ vm_mtu }}" sh -c "ip -o link show eth0 | grep -q ' mtu {{ vm_mtu }} '"
 {% for peer in peers %}
 check reachable "{{ peer.name }} node {{ peer.cp }}:6443" nc -z -w 3 {{ peer.cp }} 6443
+# 28 bytes of IP + ICMP headers: a full-size packet passes unfragmented, one more byte does not.
+check reachable "{{ vm_mtu }}-byte packet to {{ peer.name }} node, don't fragment" ping -c 1 -W 2 -M do -s {{ vm_mtu - 28 }} {{ peer.cp }}
+check blocked "{{ vm_mtu + 1 }}-byte packet to {{ peer.name }} node, don't fragment" ping -c 1 -W 2 -M do -s {{ vm_mtu - 27 }} {{ peer.cp }}
 check reachable "{{ peer.name }} LoadBalancer http://{{ peer.lb }}" curl -fsS -m 5 -o /dev/null http://{{ peer.lb }}
 check reachable "{{ peer.name }} pod http://{{ peer.pod }}:8080" curl -fsS -m 5 -o /dev/null http://{{ peer.pod }}:8080/hostname
 {% endfor %}
