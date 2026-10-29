@@ -1,5 +1,5 @@
 # Prepares the management host: packages, kernel settings, VM bridge + NAT,
-# BGP fabric (FRR), firewall and CLI tools.
+# BGP fabric (FRR), public edge (HAProxy), firewall and CLI tools.
 - name: Prepare management host
   hosts: all
   become: true
@@ -12,7 +12,7 @@
 
     - name: Install packages
       ansible.builtin.apt:
-        name: [curl, jq, nftables, ufw, frr]
+        name: [curl, jq, nftables, ufw, frr, haproxy, socat]
 
     - name: Check whether a reboot is required
       ansible.builtin.stat:
@@ -62,6 +62,7 @@
         that:
           - vm_networks | map(attribute='name') | unique | length == vm_networks | length
           - vm_networks | map(attribute='vlan_id') | unique | length == vm_networks | length
+          - bad_domains == ''
           - (vm_networks | map(attribute='asn') | unique | list + [fabric_asn]) | unique | length == vm_networks | length + 1
           - bad_names == ''
           - bad_vlans == ''
@@ -71,9 +72,22 @@
         fail_msg: >-
           Duplicate name, vlan_id or ASN; names not 1-12 lowercase alphanumerics or '-' [{{ bad_names }}];
           vlan_id outside {{ vm_vlan_id_range }} [{{ bad_vlans }}]; ASN not private [{{ bad_asns }}];
-          overlapping ranges [{{ overlaps }}]; or pod/LB ranges outside fabric_routed_cidr [{{ outside }}].
+          overlapping ranges [{{ overlaps }}]; pod/LB ranges outside fabric_routed_cidr [{{ outside }}];
+          or domains invalid, duplicate or nested [{{ bad_domains }}].
         quiet: true
       vars:
+        # A domain may not be another's subdomain: HAProxy could not tell
+        # which cluster owns the names below it.
+        bad_domains: >-
+          {%- set out = [] -%}
+          {%- for a in vm_networks -%}
+          {%- if not (a.domain | default('')) is match('^([a-z0-9]([-a-z0-9]*[a-z0-9])?\\.)+[a-z]{2,}$') -%}
+          {%- set _ = out.append(a.name ~ ': ' ~ a.domain | default('missing')) -%}
+          {%- endif -%}
+          {%- for b in vm_networks if b.name != a.name and (a.domain == b.domain or a.domain.endswith('.' ~ b.domain)) -%}
+          {%- set _ = out.append(a.domain ~ ' / ' ~ b.domain) -%}
+          {%- endfor -%}{%- endfor -%}
+          {{ out | join(', ') }}
         bad_names: >-
           {{ vm_networks | map(attribute='name') | reject('match', '^[a-z0-9]([-a-z0-9]{0,10}[a-z0-9])?$') | join(', ') }}
         bad_vlans: >-
@@ -396,6 +410,28 @@
         to_port: "{{ item.1 | string }}"
       loop: "{{ admin_sources | product(admin_tcp_ports) | list }}"
 
+    - name: Admin access (former ports)
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        from_ip: "{{ item.0 }}"
+        to_port: "{{ item.1 | string }}"
+        delete: true
+      loop: "{{ admin_sources | product([80, 443] | difference(admin_tcp_ports)) | list }}"
+
+    # Only on the public interface and address: VMs reach neither HAProxy
+    # nor anything else on the host.
+    - name: Public edge (HAProxy)
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ node_iface }}"
+        proto: tcp
+        to_ip: "{{ node_ip }}"
+        to_port: "{{ item | string }}"
+        comment: kubevirt-infra public edge
+      loop: "{{ public_tcp_ports }}"
+
     - name: Cluster networks may reach the host
       community.general.ufw:
         rule: allow
@@ -551,6 +587,24 @@
         enabled: true
         state: started
 
+    # --- Public edge (HAProxy) -------------------------------------------
+    # Internet -> node_ip:80/443 -> each cluster's Gateway "ingress", by
+    # hostname. Follows the BGP routes, so the management cluster is on no
+    # traffic path.
+    - name: HAProxy configuration
+      ansible.builtin.template:
+        src: ../templates/haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        mode: "0644"
+        validate: haproxy -c -f %s
+      notify: Reload haproxy
+
+    - name: Enable HAProxy
+      ansible.builtin.systemd_service:
+        name: haproxy
+        enabled: true
+        state: started
+
     # --- Tools -----------------------------------------------------------
     - name: Check installed helm version
       ansible.builtin.command: /usr/local/bin/helm version --template {% raw %}'{{ .Version }}'{% endraw %}
@@ -687,6 +741,12 @@
       ansible.builtin.command: /usr/lib/frr/frr-reload.py --reload /etc/frr/frr.conf
       changed_when: true
       when: frr_restart is not defined or frr_restart is skipped
+
+    # Graceful: open connections finish on the old process.
+    - name: Reload haproxy
+      ansible.builtin.systemd_service:
+        name: haproxy
+        state: reloaded
 
     # Creates new netdevs and reconfigures links whose .network changed.
     - name: Reload networkd

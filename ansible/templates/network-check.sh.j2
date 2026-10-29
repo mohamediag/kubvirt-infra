@@ -18,6 +18,10 @@ check reachable "{{ peer.name }} LoadBalancer http://{{ peer.lb }}" curl -fsS -m
 check reachable "{{ peer.name }} pod http://{{ peer.pod }}:8080" curl -fsS -m 5 -o /dev/null http://{{ peer.pod }}:8080/hostname
 {% endfor %}
 check blocked "host {{ node_ip }}:22" nc -z -w 3 {{ node_ip }} 22
+# The public edge is for the internet side only.
+{% for port in public_tcp_ports %}
+check blocked "host edge {{ node_ip }}:{{ port }}" nc -z -w 3 {{ node_ip }} {{ port }}
+{% endfor %}
 check blocked "host gateway {{ src.gateway }}:22" nc -z -w 3 {{ src.gateway }} 22
 check blocked "management API {{ node_ip }}:6443" nc -z -w 3 {{ node_ip }} 6443
 check blocked "management service network {{ service_cidr | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }}:53" nc -z -w 3 {{ service_cidr | ansible.utils.ipaddr('10') | ansible.utils.ipaddr('address') }} 53

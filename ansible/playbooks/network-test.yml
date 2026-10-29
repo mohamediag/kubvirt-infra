@@ -2,7 +2,8 @@
 # fabric; from every cluster's control plane, internet and other clusters
 # (nodes, pods, LoadBalancer IPs) reachable, the host and the management
 # cluster's networks blocked; pods reach other clusters' pods with their own
-# IP (no SNAT).
+# IP (no SNAT); from the internet side, HAProxy sends each cluster's domain to
+# that cluster's Gateway, over HTTP and HTTPS (passed through).
 - name: Workload cluster network test
   hosts: all
   become: true
@@ -29,10 +30,13 @@
                        'nodes': 1 + (xr.spec.workers.replicas | default(2)),
                        'subnet': xr.spec.network.subnet,
                        'gateway': prefix ~ '.1',
+                       'domain': site.domain,
+                       'ingress': site.lb_cidr | ansible.utils.ipaddr('-2') | ansible.utils.ipaddr('address'),
                        'kubeconfig': '/root/.kube/' ~ xr.metadata.name ~ '.kubeconfig'}] }}"
       vars:
         xr: "{{ lookup('file', item.path) | from_yaml }}"
         prefix: "{{ xr.spec.network.subnet | regex_replace('\\.0/24$', '') }}"
+        site: "{{ vm_networks | selectattr('name', 'equalto', xr.metadata.name) | first }}"
       loop: "{{ cluster_files.files | sort(attribute='path') }}"
       loop_control:
         label: "{{ item.path | dirname | basename }}"
@@ -68,7 +72,17 @@
         $k expose deployment echo --type=LoadBalancer --port=80 --target-port=8080 --dry-run=client -o yaml | $k apply -f -
         $k rollout status deployment/echo --timeout=300s >/dev/null
         $k wait svc/echo --for=jsonpath='{.status.loadBalancer.ingress[0].ip}' --timeout=120s >/dev/null
-        echo "$($k get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}') $($k get pod -l app=echo -o jsonpath='{.items[0].status.podIP}')"
+        $k apply -f - >/dev/null <<EOF
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata: {name: echo}
+        spec:
+          parentRefs: [{name: ingress, namespace: gateway}]
+          hostnames: [echo.{{ item.domain }}]
+          rules: [{backendRefs: [{name: echo, port: 80}]}]
+        EOF
+        $k wait httproute/echo --for=jsonpath='{.status.parents[0].conditions[?(@.type=="Accepted")].status}'=True --timeout=120s >/dev/null
+        echo "$($k get svc echo -o jsonpath='{.status.loadBalancer.ingress[0].ip}') $($k get pod -l app=echo -o jsonpath='{.items[0].status.podIP} {.items[0].metadata.name}')"
       vars:
         echo_image: registry.k8s.io/e2e-test-images/agnhost:2.53
       loop: "{{ clusters }}"
@@ -79,7 +93,7 @@
 
     - name: Record LoadBalancer IPs
       ansible.builtin.set_fact:
-        with_lb: "{{ with_lb | default([]) + [item.0 | combine({'lb': ips[0], 'pod': ips[1]})] }}"
+        with_lb: "{{ with_lb | default([]) + [item.0 | combine({'lb': ips[0], 'pod': ips[1], 'pod_name': ips[2]})] }}"
       vars:
         ips: "{{ (item.1.stdout_lines | last).split() }}"
       loop: "{{ clusters | zip(lb.results) | list }}"
@@ -117,9 +131,17 @@
       changed_when: false
       failed_when: no_snat.stdout != item.0.pod
 
+    - name: Run checks of the public edge from the host
+      ansible.builtin.shell: sh -s
+      args:
+        stdin: "{{ lookup('template', '../templates/ingress-check.sh.j2') }}"
+      register: edge_checks
+      changed_when: false
+
     - name: Results
       ansible.builtin.debug:
-        msg: "{{ checks.results | map(attribute='stdout_lines') | zip(clusters | map(attribute='name')) | map('reverse') | community.general.dict }}"
+        msg: "{{ checks.results | map(attribute='stdout_lines') | zip(clusters | map(attribute='name')) | map('reverse') | community.general.dict
+                 | combine({'edge': edge_checks.stdout_lines}) }}"
 
     - name: Remove test services
       ansible.builtin.command: kubectl --kubeconfig {{ item.kubeconfig }} delete namespace network-test --wait=false
@@ -130,6 +152,6 @@
 
     - name: All checks passed
       ansible.builtin.assert:
-        that: checks.results | map(attribute='stdout') | select('search', 'FAIL') | list | length == 0
+        that: (checks.results | map(attribute='stdout') | list + [edge_checks.stdout]) | select('search', 'FAIL') | list | length == 0
         fail_msg: Some network checks failed, see Results above.
         quiet: true

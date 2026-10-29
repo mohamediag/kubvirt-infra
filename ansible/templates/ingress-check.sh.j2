@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs on the host. The public edge: HAProxy on {{ node_ip }} routes each
+# cluster's domain to its Gateway "ingress". Prints PASS/FAIL per expectation.
+expect() {
+  desc=$1; want=$2; got=$3
+  if [ "$got" = "$want" ]; then echo "PASS $desc: $got"; else echo "FAIL $desc: want $want, got $got"; fi
+}
+{% for c in clusters %}
+{% set host = 'echo.' ~ c.domain %}
+# {{ c.name }}: echo pod {{ c.pod_name }} behind HTTPRoute {{ host }}
+n=$(ip -j route show {{ c.ingress }} | jq '.[0].nexthops // [.[0]] | length')
+expect "{{ c.name }} Gateway {{ c.ingress }}: ECMP paths from the fabric" {{ c.nodes }} "$n"
+expect "{{ c.name }} http://{{ host }} lands in {{ c.name }}" {{ c.pod_name }} \
+  "$(curl -fsS -m 10 --resolve {{ host }}:80:{{ node_ip }} http://{{ host }}/hostname 2>&1)"
+expect "{{ c.name }} https://{{ host }} lands in {{ c.name }}" {{ c.pod_name }} \
+  "$(curl -fsS -m 10 -k --resolve {{ host }}:443:{{ node_ip }} https://{{ host }}/hostname 2>&1)"
+# The host's own address is the client here.
+expect "{{ c.name }} X-Forwarded-For starts with the client IP" {{ node_ip }} \
+  "$(curl -fsS -m 10 --resolve {{ host }}:80:{{ node_ip }} 'http://{{ host }}/header?key=X-Forwarded-For' 2>&1 | cut -d, -f1)"
+# Passthrough: the certificate is the cluster's own placeholder.
+expect "{{ c.name }} TLS certificate is the cluster's" "CN=*.{{ c.domain }}" \
+  "$(openssl s_client -connect {{ node_ip }}:443 -servername {{ host }} </dev/null 2>/dev/null | openssl x509 -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')"
+{% endfor %}
+expect "unknown Host header" 404 \
+  "$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H 'Host: echo.unknown.example' http://{{ node_ip }}/)"
+if openssl s_client -connect {{ node_ip }}:443 -servername echo.unknown.example </dev/null >/dev/null 2>&1; then got=handshake; else got=closed; fi
+expect "unknown SNI" closed "$got"
+expect "only HAProxy listens on :80/:443" haproxy \
+  "$(ss -Hltnp '( sport = :80 or sport = :443 )' | grep -o 'users:(("[^"]*"' | cut -d'"' -f2 | sort -u | tr '\n' ' ' | sed 's/ $//')"
+expect "no Gateway API in the management cluster" 0 "$(kubectl get crd -o name | grep -c '\.gateway\.networking\.k8s\.io$')"
+expect "console on 127.0.0.1:{{ console.local_port }} (tunnel endpoint)" 200 \
+  "$(curl -s -m 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:{{ console.local_port }}/healthz)"

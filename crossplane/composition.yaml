@@ -1,7 +1,9 @@
 # Renders a KubernetesCluster into KubeVirt VMs that bootstrap k3s + Cilium
 # with cloud-init. Everything is created in the XR's namespace. Cilium routes
 # pods natively and announces pod CIDRs and LoadBalancer IPs over BGP to the
-# fabric described by EnvironmentConfig "fabric".
+# fabric described by EnvironmentConfig "fabric", and implements the Gateway
+# API: Gateway gateway/ingress is the cluster's public entry point (HAProxy on
+# the host sends it the cluster's domain).
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
@@ -45,6 +47,9 @@ spec:
             {{- $gateway := printf "%s.1" $prefix }}
             {{- $secretName := printf "%s-kubeconfig" $name }}
             {{- $fabric := index .context "apiextensions.crossplane.io/environment" }}
+            {{- /* domain, address (Gateway "ingress") and the LoadBalancer pool
+                   around it; absent: no ingress Gateway. */}}
+            {{- $ingress := index (default (dict) $fabric.ingress) $name }}
 
             {{- /* Join token: generated once, then read back from the observed Secret. */}}
             {{- $token := randAlphaNum 48 }}
@@ -172,6 +177,7 @@ spec:
                               clusterPoolIPv4PodCIDRList: [{{ $net.podCIDR }}]
                           operator:
                             replicas: 1
+                            rollOutPods: true
                           devices: [eth0]
                           # No overlay: nodes of the cluster route pod blocks to
                           # each other on their bridge, everything else goes to the
@@ -200,6 +206,20 @@ spec:
                           k8sClientRateLimit:
                             qps: 50
                             burst: 100
+                          # HAProxy on the host is the one proxy in front: its
+                          # X-Forwarded-For is kept.
+                          gatewayAPI:
+                            enabled: true
+                            xffNumTrustedHops: 1
+                            # Not "auto", which skips the GatewayClass when the
+                            # CRDs are missing at render time: helm-controller
+                            # retries until they exist instead.
+                            gatewayClass:
+                              create: "true"
+                          # Configuration changes restart the pods.
+                          rollOutCiliumPods: true
+                          envoy:
+                            rollOutPods: true
                           hubble:
                             relay:
                               enabled: true
@@ -212,11 +232,31 @@ spec:
                       metadata:
                         name: fabric
                       spec:
+                        {{- if $ingress }}
+                        blocks:
+                          - {start: "{{ $ingress.pool.start }}", stop: "{{ $ingress.pool.stop }}"}
+                        {{- else }}
                         # .0 and .255 confuse some clients.
                         allowFirstLastIPs: "No"
                         blocks:
                           - cidr: {{ $net.loadBalancerCIDR }}
+                        {{- end }}
                       ---
+                      {{- if $ingress }}
+                      # Reserved for Gateway gateway/ingress, HAProxy's target.
+                      apiVersion: cilium.io/v2
+                      kind: CiliumLoadBalancerIPPool
+                      metadata:
+                        name: ingress
+                      spec:
+                        blocks:
+                          - cidr: {{ $ingress.address }}/32
+                        serviceSelector:
+                          matchLabels:
+                            io.kubernetes.service.namespace: gateway
+                            gateway.networking.k8s.io/gateway-name: ingress
+                      ---
+                      {{- end }}
                       apiVersion: cilium.io/v2
                       kind: CiliumBGPClusterConfig
                       metadata:
@@ -278,12 +318,94 @@ spec:
                             selector:
                               matchExpressions:
                                 - {key: bgp.kubvirt-infra.io/skip, operator: DoesNotExist}
+                  {{- if $ingress }}
+                  # The tenant attaches HTTPRoutes from any namespace and may
+                  # replace the placeholder certificate gateway/ingress-tls
+                  # (e.g. with cert-manager).
+                  - path: /etc/kubvirt-infra/ingress.yaml
+                    content: |
+                      apiVersion: v1
+                      kind: Namespace
+                      metadata:
+                        name: gateway
+                      ---
+                      apiVersion: gateway.networking.k8s.io/v1
+                      kind: Gateway
+                      metadata:
+                        name: ingress
+                        namespace: gateway
+                      spec:
+                        gatewayClassName: cilium
+                        addresses:
+                          - {type: IPAddress, value: {{ $ingress.address }}}
+                        listeners:
+                          - name: http
+                            protocol: HTTP
+                            port: 80
+                            allowedRoutes:
+                              namespaces: {from: All}
+                          - name: https
+                            protocol: HTTPS
+                            port: 443
+                            tls:
+                              mode: Terminate
+                              certificateRefs: [{name: ingress-tls}]
+                            allowedRoutes:
+                              namespaces: {from: All}
+                  {{- end }}
+                  # Run at first boot and by `make clusters` (which first updates
+                  # the files above on running control planes).
+                  - path: /usr/local/sbin/kubvirt-infra-addons
+                    permissions: "0755"
+                    content: |
+                      #!/bin/sh
+                      # Managed by kubevirt-infra. Idempotent. With "crds": only
+                      # install the Gateway API CRDs, before k3s starts Cilium
+                      # (its chart and operator need them).
+                      set -eu
+                      K="k3s kubectl"
+                      crds=/var/lib/rancher/k3s/server/manifests/00-gateway-api.yaml
+                      if ! echo "{{ $fabric.gatewayAPI.sha256 }}  $crds" | sha256sum -c --status 2>/dev/null; then
+                        mkdir -p "$(dirname "$crds")"
+                        curl -fsSL --retry 5 -o "$crds.tmp" {{ $fabric.gatewayAPI.url }}
+                        if ! echo "{{ $fabric.gatewayAPI.sha256 }}  $crds.tmp" | sha256sum -c --status; then
+                          echo "Gateway API CRDs: checksum mismatch" >&2; rm -f "$crds.tmp"; exit 1
+                        fi
+                        mv "$crds.tmp" "$crds"
+                      fi
+                      [ "${1:-}" != crds ] || exit 0
+
+                      until $K get crd ciliumloadbalancerippools.cilium.io ciliumbgpclusterconfigs.cilium.io ciliumbgppeerconfigs.cilium.io ciliumbgpadvertisements.cilium.io >/dev/null 2>&1; do sleep 5; done
+                      $K apply -f /etc/kubvirt-infra/cilium-bgp.yaml
+                      {{- if $ingress }}
+
+                      until $K get gatewayclass cilium >/dev/null 2>&1; do sleep 5; done
+                      # The operator looks for the CRDs only at start: one that
+                      # started before them never accepts the class.
+                      if ! $K wait gatewayclass/cilium --for=condition=Accepted --timeout=60s >/dev/null 2>&1; then
+                        $K -n kube-system rollout restart deployment/cilium-operator
+                        $K wait gatewayclass/cilium --for=condition=Accepted --timeout=300s
+                      fi
+                      $K apply -f /etc/kubvirt-infra/ingress.yaml
+                      # Placeholder until the tenant installs its own certificate.
+                      if ! $K -n gateway get secret ingress-tls >/dev/null 2>&1; then
+                        d=$(mktemp -d)
+                        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
+                          -subj "/CN=*.{{ $ingress.domain }}" -addext "subjectAltName=DNS:{{ $ingress.domain }},DNS:*.{{ $ingress.domain }}" \
+                          -keyout "$d/tls.key" -out "$d/tls.crt" 2>/dev/null
+                        $K -n gateway create secret tls ingress-tls --cert="$d/tls.crt" --key="$d/tls.key"
+                        rm -rf "$d"
+                      fi
+                      {{- end }}
                   {{- end }}
                 runcmd:
                   - systemctl enable --now qemu-guest-agent
+                  {{- if eq $node.role "server" }}
+                  - /usr/local/sbin/kubvirt-infra-addons crds
+                  {{- end }}
                   - curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ $spec.k3sVersion }} sh -s - {{ $node.role }}
                   {{- if eq $node.role "server" }}
-                  - until k3s kubectl get crd ciliumloadbalancerippools.cilium.io ciliumbgpclusterconfigs.cilium.io ciliumbgppeerconfigs.cilium.io ciliumbgpadvertisements.cilium.io >/dev/null 2>&1; do sleep 5; done; k3s kubectl apply -f /etc/kubvirt-infra/cilium-bgp.yaml
+                  - /usr/local/sbin/kubvirt-infra-addons
                   {{- end }}
             ---
             apiVersion: kubevirt.io/v1

@@ -25,9 +25,13 @@ vm_dns: [1.1.1.1, 9.9.9.9]
 #   vlan_id  the cluster's segment between hosts: tagged on vm_uplink
 #            (Hetzner vSwitch IDs are 4000-4091), later a VXLAN VNI
 #   asn      private, 65000 + 10 per cluster
+#   domain   public hostnames of the cluster: <domain> and *.<domain> go to
+#            its Gateway "ingress" on the last usable IP of lb_cidr (.254)
 vm_networks:
-  - {name: cluster-a, vlan_id: 4010, cidr: 192.168.110.0/24, asn: 65010, pod_cidr: 10.110.0.0/16, lb_cidr: 10.250.110.0/24}
-  - {name: cluster-b, vlan_id: 4020, cidr: 192.168.120.0/24, asn: 65020, pod_cidr: 10.120.0.0/16, lb_cidr: 10.250.120.0/24}
+  - {name: cluster-a, vlan_id: 4010, cidr: 192.168.110.0/24, asn: 65010, pod_cidr: 10.110.0.0/16, lb_cidr: 10.250.110.0/24,
+     domain: "cluster-a.{{ ingress_domain }}"}
+  - {name: cluster-b, vlan_id: 4020, cidr: 192.168.120.0/24, asn: 65020, pod_cidr: 10.120.0.0/16, lb_cidr: 10.250.120.0/24,
+     domain: "cluster-b.{{ ingress_domain }}"}
 vm_vlan_id_range: [4000, 4091]
 # Interface carrying the cluster VLANs to the other hosts: <uplink>.<vlan_id>
 # joins br-<name>. Empty on a single host.
@@ -48,8 +52,21 @@ fabric_routed_cidr: 10.0.0.0/8
 vm_ssh_key: /root/.ssh/vm_ed25519
 vm_authorized_keys_file: /root/.ssh/authorized_keys
 
+# Parent of the cluster domains. sslip.io resolves every name ending in
+# <ip-with-dashes>.sslip.io to that IP, so no DNS records are needed; with your
+# own domain, point *.cluster-a.<domain> etc. at node_ip.
+ingress_domain: "{{ node_ip | replace('.', '-') }}.sslip.io"
+
 # Inbound access to the host itself.
 admin_sources: [94.9.253.229]
-admin_tcp_ports: [22, 80, 443]
+admin_tcp_ports: [22]
+# Open to the internet on node_iface: HAProxy, the edge for tenant apps
+# (HTTP by Host header, HTTPS by SNI, passed through).
+public_tcp_ports: [80, 443]
+
+# The Crossplane console (deployed separately) is not exposed: a
+# kubectl port-forward on the host listens on 127.0.0.1:<local_port>, reached
+# with `ssh -L 8080:localhost:8080 root@<host>`.
+console: {namespace: crossplane-console, service: crossplane-console, port: 8080, local_port: 8080}
 
 apt_upgrade: true

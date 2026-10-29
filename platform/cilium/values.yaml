@@ -26,21 +26,10 @@ cni:
 socketLB:
   hostNamespaceOnly: true
 
-# Gateway API in host network mode: Envoy listens on the host's ports, so UFW
-# (admin_sources / admin_tcp_ports) applies. A LoadBalancer/NodePort Service
-# would be handled by the eBPF datapath before UFW. Gateways: platform/gateway.
-gatewayAPI:
-  enabled: true
-  hostNetwork:
-    enabled: true
-
-# Envoy runs as its own DaemonSet; ports below 1024 need NET_BIND_SERVICE.
+# No Gateway API here: the management cluster only creates VMs and is on no
+# traffic path. Tenant apps enter through HAProxy on the host.
 envoy:
   rollOutPods: true
-  securityContext:
-    capabilities:
-      keepCapNetBindService: true
-      envoy: [NET_ADMIN, SYS_ADMIN, NET_BIND_SERVICE]
 
 hubble:
   relay:

@@ -1,5 +1,4 @@
-# Installs k3s (embedded etcd, no flannel/kube-proxy), the Gateway API CRDs and
-# Cilium as its CNI and Gateway API implementation.
+# Installs k3s (embedded etcd, no flannel/kube-proxy) and Cilium as its CNI.
 - name: Install k3s with Cilium
   hosts: all
   become: true
@@ -53,12 +52,6 @@
       delay: 5
       changed_when: false
 
-    # Cilium enables its Gateway API controller only if the CRDs exist when
-    # the operator starts.
-    - name: Gateway API CRDs
-      ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ repo_root }}/platform/gateway-api
-      changed_when: false
-
     # helm is called directly: kubernetes.core.helm does not support Helm 4 yet.
     - name: Install Cilium
       ansible.builtin.command:
@@ -78,6 +71,21 @@
           - --wait
           - --timeout=10m
       changed_when: false
+
+    # Earlier versions exposed apps through a Gateway on this cluster; the
+    # workload clusters have their own now, behind HAProxy on the host.
+    # Deleting the CRDs deletes every Gateway API object. After the Cilium
+    # upgrade: the previous release contains a GatewayClass, which helm must
+    # still be able to map.
+    - name: Remove the former Gateway API of the management cluster
+      ansible.builtin.shell: |
+        crds=$(kubectl get crd -o name | grep '\.gateway\.networking\.k8s\.io$' || true)
+        if [ -z "$crds" ] && ! kubectl get namespace gateway >/dev/null 2>&1; then exit 0; fi
+        kubectl delete namespace gateway --ignore-not-found --wait=true --timeout=300s
+        [ -z "$crds" ] || kubectl delete $crds --wait=true --timeout=300s
+        echo removed
+      register: old_gateway_api
+      changed_when: "'removed' in old_gateway_api.stdout"
 
     - name: Wait for the node to be Ready
       ansible.builtin.command: kubectl wait --for=condition=Ready node --all --timeout=300s

@@ -8,6 +8,10 @@
     repo_root: "{{ playbook_dir }}/../.."
     state: present
     ready_timeout: 1800s
+    ssh: >-
+      ssh -i {{ vm_ssh_key }} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+      -o BatchMode=yes -o ConnectTimeout=5
+    gateway_api_crds: "{{ repo_root }}/tenants/gateway-api/standard-install.yaml"
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
   tasks:
@@ -98,6 +102,12 @@
       ansible.builtin.command: kubectl apply --server-side --force-conflicts -k {{ repo_root }}/crossplane
       changed_when: false
 
+    - name: Checksum of the vendored Gateway API CRDs
+      ansible.builtin.stat:
+        path: "{{ gateway_api_crds }}"
+        checksum_algorithm: sha256
+      register: gateway_api_crds_stat
+
     - name: Fabric settings for the composition (EnvironmentConfig "fabric")
       ansible.builtin.command:
         cmd: kubectl apply --server-side -f -
@@ -111,6 +121,22 @@
             asn: "{{ fabric_asn | int }}"
             routedCIDRs: ["{{ fabric_routed_cidr }}"]
             mtu: "{{ vm_mtu | int }}"
+            # Nodes download the release and check it against the vendored copy.
+            gatewayAPI:
+              url: https://github.com/kubernetes-sigs/gateway-api/releases/download/{{ gateway_api_version }}/standard-install.yaml
+              sha256: "{{ gateway_api_crds_stat.stat.checksum }}"
+            # What HAProxy on the host sends to each cluster (haproxy.cfg.j2).
+            ingress: "{{ ingress }}"
+        ingress: >-
+          {%- set out = {} -%}
+          {%- for t in vm_networks -%}
+          {%- set _ = out.update({t.name: {
+                'domain': t.domain,
+                'address': t.lb_cidr | ansible.utils.ipaddr('-2') | ansible.utils.ipaddr('address'),
+                'pool': {'start': t.lb_cidr | ansible.utils.ipaddr('1') | ansible.utils.ipaddr('address'),
+                         'stop': t.lb_cidr | ansible.utils.ipaddr('-3') | ansible.utils.ipaddr('address')}}}) -%}
+          {%- endfor -%}
+          {{ out }}
       changed_when: false
 
     - name: Wait for the API to be established
@@ -165,6 +191,64 @@
         label: "{{ item.xr.metadata.name }}"
       changed_when: false
 
+    - name: Running clusters and their control planes
+      ansible.builtin.set_fact:
+        running: >-
+          {%- set out = [] -%}
+          {%- for c in clusters if c.xr.spec.running | default(true) -%}
+          {%- set n = c.xr.spec.network -%}
+          {%- set _ = out.append({'name': c.xr.metadata.name, 'namespace': c.xr.metadata.namespace,
+                                  'cp': n.subnet | ansible.utils.ipaddr(n.nodeIPStart | default(10)) | ansible.utils.ipaddr('address')}) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    # cloud-init runs once: control planes created by an earlier composition
+    # get its node files (Cilium chart values, BGP and ingress manifests, the
+    # add-on script) from their re-rendered cloud-init Secret, then run the
+    # script, as a new control plane does at first boot.
+    - name: Read the control planes' cloud-init
+      ansible.builtin.command: >-
+        kubectl -n {{ item.namespace }} get secret {{ item.name }}-cp-0-cloudinit
+        -o jsonpath={.data.userdata}
+      loop: "{{ running }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: userdata
+      changed_when: false
+
+    - name: Node files of the control planes
+      ansible.builtin.set_fact:
+        node_files: >-
+          {%- set out = [] -%}
+          {%- for r in userdata.results -%}
+          {%- for f in (r.stdout | b64decode | from_yaml).write_files
+                if f.path is match('^(/etc/kubvirt-infra/|/usr/local/sbin/kubvirt-infra-|/var/lib/rancher/k3s/server/manifests/)') -%}
+          {%- set _ = out.append({'cluster': r.item.name, 'cp': r.item.cp, 'path': f.path,
+                                  'mode': f.permissions | default('0644'), 'content': f.content}) -%}
+          {%- endfor -%}{%- endfor -%}
+          {{ out }}
+
+    - name: Update node files of the control planes
+      ansible.builtin.shell: >-
+        {{ ssh }} ubuntu@{{ item.cp }} sudo sh -c '"t=\$(mktemp); cat > \$t;
+        if cmp -s \$t {{ item.path }}; then echo same; else install -D -m {{ item.mode }} \$t {{ item.path }}; echo changed; fi;
+        rm -f \$t"'
+      args:
+        stdin: "{{ item.content }}"
+        stdin_add_newline: false
+      loop: "{{ node_files }}"
+      loop_control:
+        label: "{{ item.cluster }}: {{ item.path }}"
+      register: node_file_updates
+      changed_when: "'changed' in node_file_updates.stdout"
+
+    - name: Apply the add-ons on the control planes
+      ansible.builtin.shell: "{{ ssh }} ubuntu@{{ item.cp }} sudo timeout 600 /usr/local/sbin/kubvirt-infra-addons"
+      loop: "{{ running }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
     - name: Write kubeconfigs to /root/.kube/<cluster>.kubeconfig
       ansible.builtin.shell: |
         umask 077; mkdir -p /root/.kube
@@ -176,6 +260,15 @@
 
     - name: Merge them into /root/.kube/config (see host.yml)
       ansible.builtin.command: /usr/local/bin/kubeconfig-merge
+      changed_when: false
+
+    - name: Wait for the ingress Gateways
+      ansible.builtin.command: >-
+        kubectl --kubeconfig /root/.kube/{{ item.name }}.kubeconfig -n gateway
+        wait gateway/ingress --for=condition=Programmed --timeout=600s
+      loop: "{{ running }}"
+      loop_control:
+        label: "{{ item.name }}"
       changed_when: false
 
     - name: Status

@@ -1,0 +1,73 @@
+# Managed by kubevirt-infra (ansible/playbooks/host.yml). The public edge:
+# every cluster in vm_networks owns <domain> and *.<domain>, served by its
+# Gateway "ingress" on the last usable IP of its lb_cidr, reached through the
+# BGP routes of the fabric. HTTPS is passed through: the tenant holds the
+# certificates.
+global
+    log /dev/log local0
+    maxconn 20000
+    user haproxy
+    group haproxy
+    daemon
+    # Local only: echo 'show stat' | socat - /run/haproxy/admin.sock
+    stats socket /run/haproxy/admin.sock mode 660 level admin
+    stats timeout 30s
+
+defaults
+    log global
+    timeout connect 5s
+    timeout client 60s
+    timeout server 60s
+    timeout client-fin 5s
+    timeout tunnel 1h
+    timeout http-request 10s
+    timeout http-keep-alive 10s
+    default-server inter 5s fall 2 rise 2
+
+# HTTP: route on the Host header, tell the backend who the client is.
+frontend http
+    mode http
+    bind {{ node_ip }}:80
+    option httplog
+    option forwardfor
+    # Per-source limit: 1000 requests per 10s.
+    stick-table type ip size 100k expire 60s store http_req_rate(10s)
+    http-request track-sc0 src
+    http-request deny deny_status 429 if { sc_http_req_rate(0) gt 1000 }
+    http-request set-var(txn.host) req.hdr(host),field(1,:),lower
+{% for t in vm_networks %}
+    use_backend http_{{ t.name }} if { var(txn.host) -m str {{ t.domain }} } || { var(txn.host) -m end .{{ t.domain }} }
+{% endfor %}
+    default_backend unknown_host
+
+# HTTPS: wait for the TLS ClientHello and route on its SNI, without
+# decrypting. Unknown or missing SNI: the connection is closed.
+frontend https
+    mode tcp
+    bind {{ node_ip }}:443
+    option tcplog
+    # Per-source limit: 200 new connections per 10s, 500 open.
+    stick-table type ip size 100k expire 60s store conn_rate(10s),conn_cur
+    tcp-request connection track-sc0 src
+    tcp-request connection reject if { sc_conn_rate(0) gt 200 } || { sc_conn_cur(0) gt 500 }
+    tcp-request inspect-delay 5s
+    tcp-request content accept if { req.ssl_hello_type 1 }
+    tcp-request content reject
+{% for t in vm_networks %}
+    use_backend tls_{{ t.name }} if { req.ssl_sni,lower -m str {{ t.domain }} } || { req.ssl_sni,lower -m end .{{ t.domain }} }
+{% endfor %}
+
+backend unknown_host
+    mode http
+    http-request return status 404 content-type text/plain string "unknown host\n"
+{% for t in vm_networks %}
+{% set address = t.lb_cidr | ansible.utils.ipaddr('-2') | ansible.utils.ipaddr('address') %}
+
+backend http_{{ t.name }}
+    mode http
+    server ingress {{ address }}:80 check
+
+backend tls_{{ t.name }}
+    mode tcp
+    server ingress {{ address }}:443 check
+{% endfor %}
